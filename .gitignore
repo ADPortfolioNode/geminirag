@@ -1,0 +1,74 @@
+# Python-related files
+*.pyc
+*.pyo
+__pycache__/
+*.pyd
+*.pdb
+*.egg-info/
+*.eggs
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# Virtual environments
+venv/
+
+# ChromaDB storage
+chroma_db/
+chroma_storage/
+chroma_data/
+
+# Node.js-related files
+node_modules/
+
+# Frontend build files
+frontend/build/
+
+# Miscellaneous
+.DS_Store
+*.swp
+*.swo
+*.bak
+*.tmp
+*.old
+*.orig
+
+# IDE-specific files
+.idea/
+.vscode/
+
+# Debugging files
+*.stackdump
+*.trace
+
+# Coverage reports
+coverage/
+*.lcov
+
+# Lock files
+package-lock.json
+yarn.lock
+
+# Generated files
+*.sqlite3
+*.bin
+*.pickle
+*.dll
+*.exe
+
+# Temporary files
+*.tmp
+*.temp
+*.backup
+
+# Git-specific files
+*.orig
+*.rej
+*.patch
+*.diff
+
+# Ignore service account keys
+jsonkeyfile.json
