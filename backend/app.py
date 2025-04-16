@@ -1,171 +1,293 @@
 import os
+import uuid
+import logging
+import datetime
+import time
+import chromadb
+import speech_recognition as sr
+
 from flask import Flask, request, jsonify
-import google.generativeai as genai
 from flask_cors import CORS
+from dotenv import load_dotenv
+from moviepy import VideoFileClip
+from threading import Lock
+
+import google.generativeai as genai
+from tqdm import tqdm
 from langchain_community.document_loaders import DirectoryLoader
 from langchain.text_splitter import CharacterTextSplitter
-import logging
-from tqdm import tqdm
-import time
-from moviepy import VideoFileClip, AudioFileClip
-import speech_recognition as sr
-import datetime
+from langchain.prompts import PromptTemplate
+from langchain_chroma import Chroma
+from chromadb.utils import embedding_functions
+from langchain_google_genai import GoogleGenerativeAI
+from langchain.chains import RetrievalQA
+from langchain_core.embeddings import Embeddings
 
+# === ENV INIT ===
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise Exception("Missing GOOGLE_API_KEY")
+
+# === APP INIT ===
 app = Flask(__name__)
-# Enable CORS for all routes
-CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
-# Ensure your Google API key is set in your environment
-API_KEY = os.environ.get("GOOGLE_API_KEY")
-if not API_KEY:
-    raise Exception("Missing GOOGLE_API_KEY environment variable.")
+CORS(app, resources={r"/*": {"origins": "*"}})  # Allow requests from the frontend origin
 
-# Configure the generativeai client with your API key
-genai.configure(api_key=API_KEY)
+# === STATUS TRACKING ===
+query_status_map = {}
+status_lock = Lock()
 
-# Instantiate the GenerativeModel with the valid model name and desired parameters
-model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash-exp",  # Valid model name
-    generation_config={
-        "temperature": 0.7,
-        "top_p": 0.95,
-        "max_output_tokens": 2048
-    }
+# === EMBEDDING WRAPPER ===
+class SentenceTransformerWrapper(Embeddings):
+    def __init__(self, model_name="all-mpnet-base-v2"):
+        self._ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
+    def embed_documents(self, texts):
+        return self._ef(texts)
+    def embed_query(self, text):
+        return self._ef([text])[0]
+
+# === VECTORSTORE SETUP ===
+embedding_function = SentenceTransformerWrapper()
+chroma_client = chromadb.PersistentClient(path="chroma_db")
+vectordb = Chroma(
+    client=chroma_client,
+    collection_name="documents_collection",
+    embedding_function=embedding_function
 )
 
+# === LLM SETUP WITH FAILSAFE ===
+genai.configure(api_key=GOOGLE_API_KEY)
+
+# Define a list of compatible models for GoogleGenerativeAI
+compatible_models = [
+    "models/gemini-1.5-pro-001",
+    "models/gemini-1.5-pro-002",
+    "models/gemini-2.0-flash",
+    "models/gemini-2.0-flash-001",
+    "models/gemini-2.0-pro-exp",
+    # Add other compatible models as needed
+]
+
+# Fetch available models and validate the model name
+try:
+    available_models = genai.list_models()
+    if not available_models:
+        logging.error("[LLM Setup] No models returned by the API. Check your API key and permissions.")
+        raise Exception("No models available in the Generative AI API.")
+
+    # Log the raw structure of the models for debugging
+    logging.info(f"[LLM Setup] Raw model data: {available_models}")
+
+    # Extract model details based on the actual structure of the objects
+    model_details = [
+        {"name": getattr(model, 'name', None), "methods": getattr(model, 'supportedMethods', [])}
+        for model in available_models
+    ]
+    logging.info(f"[LLM Setup] Available models and their supported methods: {model_details}")
+
+    # Select the first compatible model from the available models
+    selected_model = next(
+        (model['name'] for model in model_details if model['name'] in compatible_models),
+        None
+    )
+    if not selected_model:
+        logging.warning("[LLM Setup] No compatible models found. Using a hardcoded fallback model.")
+        selected_model = "models/gemini-1.5-pro-001"  # Replace with a valid fallback model if known
+except Exception as e:
+    logging.error(f"[LLM Setup] Failed to fetch models: {e}")
+    # Failsafe: Use a hardcoded default model or disable LLM functionality
+    selected_model = "models/gemini-1.5-pro-001"  # Replace with a valid fallback model if known
+    logging.warning(f"[LLM Setup] Failsafe activated. Using fallback model: {selected_model}")
+
+try:
+    llm = GoogleGenerativeAI(
+        model=selected_model,
+        temperature=0.7,
+        top_p=0.95,
+        max_output_tokens=2048
+    )
+    logging.info(f"[LLM Setup] Using model: {selected_model}")
+except Exception as e:
+    logging.error(f"[LLM Setup] Failed to initialize LLM with model '{selected_model}': {e}")
+    raise Exception("Critical error: Unable to configure the LLM.")
+
+# === QA CHAIN ===
+PROMPT = PromptTemplate(
+    template="""You are a helpful assistant. Use the following context to answer the question at the end. If you don't know, say so.
+
+Context:
+{context}
+
+Question: {question}
+Helpful Answer:""",
+    input_variables=["context", "question"]
+)
+
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    chain_type="stuff",
+    retriever=vectordb.as_retriever(search_kwargs={"k": 3}),
+    return_source_documents=True,
+    chain_type_kwargs={"prompt": PROMPT}
+)
+
+# === MULTIMEDIA EXTRACTION ===
 def extract_text_from_multimedia(file_path):
-    """Extract text from multimedia files (audio/video)."""
     try:
         if file_path.endswith(('.mp4', '.avi', '.mov')):
-            # Extract audio from video
             video = VideoFileClip(file_path)
             audio_path = file_path.replace(file_path.split('.')[-1], 'wav')
             video.audio.write_audiofile(audio_path)
             file_path = audio_path
 
         if file_path.endswith(('.mp3', '.wav', '.ogg')):
-            # Transcribe audio to text
             recognizer = sr.Recognizer()
             with sr.AudioFile(file_path) as source:
                 audio_data = recognizer.record(source)
                 return recognizer.recognize_google(audio_data)
 
+        if file_path.endswith('.pdf'):
+            try:
+                from unstructured.partition.pdf import partition_pdf
+                elements = partition_pdf(file_path)
+                return "\n".join([str(element) for element in elements])
+            except ImportError:
+                logging.error("[PDF Processing] Missing dependencies for partition_pdf(). Install with: pip install 'unstructured[pdf]'")
+                return "Error: Missing dependencies for PDF processing."
     except Exception as e:
-        logging.error(f"Error extracting text from multimedia: {e}")
+        logging.error(f"[Multimedia] {e}")
         return ""
 
-def get_rag_response(query):
-    """Performs RAG (Retrieval Augmented Generation) using ChromaDB and OpenAI API."""
-    try:
-        # Query ChromaDB for relevant context
-        results = collection.query(query_texts=[query], n_results=5)
-        context = "\n".join([doc for doc in results["documents"][0]])
-
-        # If context is found in ChromaDB, use it to construct the prompt
-        if context:
-            prompt = f"""
-            Use the following context to answer the question at the end. 
-            If you don't know the answer, just say that you don't know, don't try to make up an answer.
-
-            Context:
-            {context}
-
-            Question: {query}
-            """
-        else:
-            # If no context is found, fallback to a general internet search
-            prompt = f"""
-            You are a helpful assistant. Answer the following question based on your general knowledge:
-
-            Question: {query}
-            """
-
-        # Generate a response using OpenAI API
-        completion = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        return completion.choices[0].message.content
-
-    except Exception as e:
-        logging.error(f"Error in RAG workflow: {e}")
-        return "Error retrieving context or generating response."
-
-@app.route("/api/query", methods=["POST"])
-def query():
-    data = request.get_json()
-    query_text = data.get("query")
-    if not query_text:
-        return jsonify({"error": "No query provided"}), 400
-
-    try:
-        # Simulate progress tracking
-        for i in tqdm(range(5), desc="Processing query"):
-            time.sleep(1)  # Simulate processing time
-
-        # Generate content using the updated model
-        response = model.generate_content(query_text)
-        return jsonify({"response": response.text})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+# === UPLOAD ENDPOINT ===
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
     if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+        logging.error("[Upload] No file part in the request.")
+        return jsonify({'error': 'No file part in the request.'}), 400
+
     file = request.files['file']
     if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+        logging.error("[Upload] No file selected for upload.")
+        return jsonify({'error': 'No file selected for upload.'}), 400
 
     try:
-        # Save the uploaded file to the uploads directory
+        # Ensure the uploads directory exists
         os.makedirs("uploads", exist_ok=True)
         filepath = os.path.join("uploads", file.filename)
         file.save(filepath)
 
-        # Process multimedia files
-        if filepath.split('.')[-1].lower() in ('mp4', 'avi', 'mov', 'mp3', 'wav', 'ogg'):
-            extracted_text = extract_text_from_multimedia(filepath)
-            if extracted_text:
-                # Add extracted text to ChromaDB
-                vectordb.add_documents([{
-                    'content': extracted_text,
-                    'metadata': {'source': file.filename}
-                }])
+        ext = filepath.split('.')[-1].lower()
+        if ext in ('mp4', 'avi', 'mov', 'mp3', 'wav', 'ogg'):
+            # Process multimedia files
+            text = extract_text_from_multimedia(filepath)
+            if text:
+                vectordb.add_texts([text], metadatas=[{"source": file.filename}])
+                logging.info(f"[Upload] Multimedia file processed: {file.filename}")
+            else:
+                logging.warning(f"[Upload] No text extracted from multimedia file: {file.filename}")
+        elif ext == 'pdf':
+            # Process PDF files
+            try:
+                from unstructured.partition.pdf import partition_pdf
+                elements = partition_pdf(filepath)
+                text = "\n".join([str(element) for element in elements])
+                vectordb.add_texts([text], metadatas=[{"source": file.filename}])
+                logging.info(f"[Upload] PDF file processed: {file.filename}")
+            except ImportError:
+                logging.error("[Upload] Missing dependencies for PDF processing. Install with: pip install 'unstructured[pdf]'")
+                return jsonify({'error': 'Missing dependencies for PDF processing. Install with: pip install "unstructured[pdf]"'}), 500
         else:
-            # Handle text files
-            loader = DirectoryLoader(filepath)
+            # Process other text-based files
+            loader = DirectoryLoader("uploads", glob="**/*")
             documents = loader.load()
-            text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-            docs = text_splitter.split_documents(documents)
-            vectordb.add_documents(docs)
+            splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+            split_docs = splitter.split_documents(documents)
+            vectordb.add_documents(split_docs)
+            logging.info(f"[Upload] Text-based file processed: {file.filename}")
 
-        # Sync uploaded documents to ensure the last document is accurate
-        sync_uploaded_documents()
+        return jsonify({'message': '✅ File uploaded & processed successfully.'}), 200
 
-        return jsonify({'message': 'File uploaded and processed successfully'}), 200
     except Exception as e:
-        logging.error(f"Error processing file upload: {e}")
-        return jsonify({'error': str(e)}), 500
+        logging.error(f"[Upload] An error occurred while processing the file: {e}", exc_info=True)
+        return jsonify({'error': 'An error occurred while processing the file. Please try again later.'}), 500
 
-def sync_uploaded_documents():
-    """Syncs the uploaded documents to ensure the last document is accurate."""
+# === QUERY ENDPOINT WITH PER-REQUEST STATUS ===
+@app.route("/api/query", methods=["POST"])
+def query():
+    data = request.get_json()
+    if not data:
+        logging.error("[Query] No JSON payload received.")
+        return jsonify({"error": "Invalid request. No JSON payload received."}), 400
+
+    query_text = data.get("query", "").strip()
+    if not query_text:
+        logging.error("[Query] No query provided in the request.")
+        return jsonify({"error": "No query provided"}), 400
+
+    query_id = str(uuid.uuid4())
+    with status_lock:
+        query_status_map[query_id] = {"phase": "loading", "progress": 10}
+
     try:
-        uploads_dir = "uploads"
-        if not os.path.exists(uploads_dir):
-            return
+        logging.info(f"[Query] Processing query: {query_text}")
 
-        for filename in os.listdir(uploads_dir):
-            file_path = os.path.join(uploads_dir, filename)
-            if os.path.isfile(file_path):
-                loader = DirectoryLoader(uploads_dir, glob="**/*")
-                documents = loader.load()
-                text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-                docs = text_splitter.split_documents(documents)
-                vectordb.add_documents(docs)
+        for _ in tqdm(range(3)):
+            time.sleep(0.3)
+
+        with status_lock:
+            query_status_map[query_id] = {"phase": "retrieving", "progress": 50}
+
+        result = qa_chain.invoke({"query": query_text})
+        if not result:
+            raise ValueError("No result returned from QA chain.")
+
+        answer = result.get("result", "No answer found.")
+        sources = [
+            doc.metadata.get("source", "unknown") for doc in result.get("source_documents", [])
+        ]
+
+        with status_lock:
+            query_status_map[query_id] = {"phase": "done", "progress": 100}
+
+        logging.info(f"[Query] Query processed successfully. ID: {query_id}")
+        return jsonify({
+            "id": query_id,
+            "answer": answer,
+            "sources": sources
+        })
+
+    except google.generativeai.exceptions.ResourceExhausted as e:
+        logging.error(f"[Query Error] Quota exceeded: {e}")
+        return jsonify({"error": "Quota exceeded. Please check your plan and billing details."}), 429
+
     except Exception as e:
-        logging.error(f"Error syncing uploaded documents: {e}")
+        logging.error(f"[Query Error] {e}", exc_info=True)
+        with status_lock:
+            query_status_map[query_id] = {"phase": "error", "progress": 0}
+        return jsonify({"error": "An error occurred while processing the query. Please try again later."}), 500
 
+# === STATUS ENDPOINT ===
+@app.route("/api/result/<query_id>", methods=["GET"])
+def get_result(query_id):
+    global query_status_map
+    result = query_status_map.get(query_id)
+    if not result:
+        logging.error(f"[Result] Query ID {query_id} not found in result map.")
+        return jsonify({"error": "Result not found"}), 404
+    return jsonify(result)
+
+@app.route("/api/query_status/<query_id>", methods=["GET"])
+def get_query_status(query_id):
+    with status_lock:
+        status = query_status_map.get(query_id, {"phase": "unknown", "progress": 0})
+    return jsonify(status)
+
+@app.route("/api/status", methods=["GET"])
+def get_system_status():
+    return jsonify({"status": "Server is running", "uptime": "24 hours"}), 200
+
+# === DOCUMENT LISTING ===
 @app.route("/api/documents", methods=["GET"])
 def get_documents():
     try:
@@ -177,19 +299,19 @@ def get_documents():
         for filename in os.listdir(uploads_dir):
             file_path = os.path.join(uploads_dir, filename)
             if os.path.isfile(file_path):
-                file_type = filename.split(".")[-1].upper()
-                upload_date = datetime.datetime.fromtimestamp(os.path.getctime(file_path)).strftime("%Y-%m-%d %H:%M:%S")
+                upload_time = datetime.datetime.fromtimestamp(os.path.getctime(file_path))
                 documents.append({
                     "name": filename,
-                    "type": file_type,
-                    "uploadDate": upload_date
+                    "type": filename.split(".")[-1].upper(),
+                    "uploadDate": upload_time.strftime("%Y-%m-%d %H:%M:%S")
                 })
 
         return jsonify(documents)
     except Exception as e:
-        logging.error(f"Error fetching documents: {e}")
+        logging.error(f"[Documents] {e}")
         return jsonify({"error": "Failed to fetch documents."}), 500
 
+# === LAUNCH SERVER ===
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
