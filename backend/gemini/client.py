@@ -79,6 +79,8 @@ class GeminiAPI:
                 source_suffix = "\n\n(Source: Internal Documents)"
             elif source_type == "internet" and documents:
                 source_suffix = "\n\n(Source: Internet Search)"
+            elif source_type == "external" and documents: # Add external source suffix
+                 source_suffix = "\n\n(Source: Provided Context)"
             elif source_type == "none":
                  source_suffix = "\n\n(Source: General Knowledge - No specific documents found)"
 

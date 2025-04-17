@@ -126,64 +126,84 @@ def handle_query():
         return jsonify({'error': 'Missing query in request body.'}), 400
 
     query = data.get('query', '').strip()
-    # Get optional task instruction from request
     task_instruction = data.get('task_instruction', None)
+    # *** NEW: Get optional external context ***
+    external_context = data.get('external_context', None) # Expecting a list of strings
     query_lower = query.lower()
-    logging.info(f"Received query: '{query}' (Task: {task_instruction or 'Default'})")
+    logging.info(f"Received query: '{query}' (Task: {task_instruction or 'Default'}, External Context: {'Yes' if external_context else 'No'})")
 
     # --- Intent Inference for Document Count ---
-    # Check if it's explicitly a count query *before* RAG
-    is_count_query = False
-    if not task_instruction: # Only infer count if no specific task is given
+    # Only run if no external context and no specific task instruction
+    if not external_context and not task_instruction:
+        is_count_query = False
         contains_count_keyword = any(keyword in query_lower for keyword in COUNT_KEYWORDS)
         contains_doc_keyword = any(keyword in query_lower for keyword in DOCUMENT_KEYWORDS)
         if contains_count_keyword and contains_doc_keyword:
              is_count_query = True
 
-    if is_count_query:
-        logging.info("Inferred intent: Document count query.")
-        try:
-            count = chromadb_wrapper.count_documents()
-            if count != -1:
-                if count == 0:
-                    answer = "There are currently no documents indexed."
-                elif count == 1:
-                    answer = "There is currently 1 document indexed."
+        if is_count_query:
+            logging.info("Inferred intent: Document count query.")
+            try:
+                count = chromadb_wrapper.count_documents()
+                if count != -1:
+                    if count == 0:
+                        answer = "There are currently no documents indexed."
+                    elif count == 1:
+                        answer = "There is currently 1 document indexed."
+                    else:
+                        answer = f"There are currently {count} documents indexed."
+                    return jsonify({'answer': answer})
                 else:
-                    answer = f"There are currently {count} documents indexed."
-                return jsonify({'answer': answer})
-            else:
-                return jsonify({'error': 'Sorry, I encountered an issue trying to count the documents.'}), 500
-        except Exception as e:
-            logging.error(f"Error handling inferred document count query: {e}", exc_info=True)
-            return jsonify({'error': 'An internal error occurred while counting documents.'}), 500
+                    return jsonify({'error': 'Sorry, I encountered an issue trying to count the documents.'}), 500
+            except Exception as e:
+                logging.error(f"Error handling inferred document count query: {e}", exc_info=True)
+                return jsonify({'error': 'An internal error occurred while counting documents.'}), 500
     # --- End Intent Inference ---
 
-    # --- RAG Workflow with Internet Fallback & Task Instruction ---
+    # --- RAG Workflow ---
     try:
-        logging.info("Step 1: Retrieving documents from ChromaDB...")
-        # Increase n_results slightly for more context?
-        chroma_documents = chromadb_wrapper.retrieve(query, n_results=7)
+        documents = []
+        source_type = "none"
 
-        # *** ADD LOGGING HERE ***
-        if chroma_documents:
-            logging.info(f"Found {len(chroma_documents)} relevant document chunks in ChromaDB.")
-            # Log snippets for verification (optional, can be verbose)
-            for i, doc in enumerate(chroma_documents):
-                 logging.debug(f"  Doc {i+1}: {doc[:100]}...") # Log first 100 chars
-            # Pass task_instruction to generate_response
-            answer = gemini.generate_response(query, chroma_documents, source_type="documents", task_instruction=task_instruction)
+        # *** Check for external context first ***
+        if external_context and isinstance(external_context, list):
+            logging.info(f"Using provided external context ({len(external_context)} items).")
+            documents = external_context
+            source_type = "external"
         else:
-            # Fallback logic remains the same
-            logging.info("No relevant documents found in ChromaDB. Step 2: Performing internet search...")
-            internet_results = perform_internet_search(query)
+            # --- Original RAG/Search Logic (if no external context) ---
+            logging.info("Step 1: Retrieving documents from ChromaDB...")
+            chroma_documents = chromadb_wrapper.retrieve(query, n_results=7)
 
-            if internet_results:
-                logging.info(f"Found {len(internet_results)} results from internet search.")
-                answer = gemini.generate_response(query, internet_results, source_type="internet", task_instruction=task_instruction)
+            if chroma_documents:
+                logging.info(f"Found {len(chroma_documents)} relevant document chunks in ChromaDB.")
+                # Log snippets for verification (optional, can be verbose)
+                for i, doc in enumerate(chroma_documents):
+                     logging.debug(f"  Doc {i+1}: {doc[:100]}...")
+                documents = chroma_documents
+                source_type = "documents"
             else:
-                logging.info("No relevant results found from internet search. Step 3: Generating response from general knowledge.")
-                answer = gemini.generate_response(query, [], source_type="none", task_instruction=task_instruction)
+                # Fallback to internet search
+                logging.info("No relevant documents found in ChromaDB. Step 2: Performing internet search...")
+                internet_results = perform_internet_search(query)
+                if internet_results:
+                    logging.info(f"Found {len(internet_results)} results from internet search.")
+                    documents = internet_results
+                    source_type = "internet"
+                else:
+                    logging.info("No relevant results found from internet search or ChromaDB.")
+                    # documents remains []
+                    # source_type remains "none"
+            # --- End Original RAG/Search Logic ---
+
+        # --- Generation Step (Common for all paths) ---
+        logging.info(f"Step 3: Generating response using source type '{source_type}'.")
+        answer = gemini.generate_response(
+            query=query, # Pass the original query for context if needed by LLM
+            documents=documents,
+            source_type=source_type,
+            task_instruction=task_instruction
+        )
 
         logging.info(f"Generated answer for query '{query}'.")
         return jsonify({'answer': answer})
@@ -207,12 +227,11 @@ def generate_plan():
         # Define assistant types available for planning
         # Keep this list updated if assistant capabilities change
         available_assistants = [
-            "Internet Searcher: Searches the web for current information.",
+            "Internet Searcher: Searches the web for current information on a specific topic.", # Clarify role
             "File Manager: Reads, writes, or modifies files in the persistent storage.",
             "ChromaDB Admin: Queries the vector database for relevant documents or counts items.",
             "Gemini API Admin: Generates text, summarizes, answers questions based on context or general knowledge.",
             "Code Interpreter: Executes Python code snippets (Use with caution!)."
-            # Exclude Concierge, Flask Admin, Function Caller unless they have specific plannable actions
         ]
         assistants_description = "\n".join([f"- {a}" for a in available_assistants])
 
@@ -248,6 +267,27 @@ def generate_plan():
     except Exception as e:
         logging.error(f"[Plan] Error generating plan for query '{query}': {e}", exc_info=True)
         return jsonify({'error': 'An internal error occurred while generating the plan.'}), 500
+
+# --- NEW: Endpoint specifically for Internet Search ---
+@app.route('/api/search', methods=['POST'])
+def handle_search():
+    data = request.json
+    if not data or 'query' not in data:
+        logging.warning("[Search] Received search request with missing data or query field.")
+        return jsonify({'error': 'Missing query in request body.'}), 400
+
+    query = data.get('query', '').strip()
+    num_results = data.get('num_results', 3) # Allow specifying number of results
+
+    logging.info(f"[Search] Received internet search request for: '{query}'")
+    try:
+        search_results = perform_internet_search(query, num_results=num_results)
+        logging.info(f"[Search] Found {len(search_results)} results for '{query}'.")
+        # Return results as a list under the 'results' key
+        return jsonify({'results': search_results})
+    except Exception as e:
+        logging.error(f"[Search] Error performing internet search for query '{query}': {e}", exc_info=True)
+        return jsonify({'error': 'An internal error occurred while performing the search.'}), 500
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
