@@ -25,6 +25,10 @@ This document provides step-by-step instructions for setting up, running, and te
    - Install Python and Node.js.
    - Install `pip` for Python package management.
 
+5. **Vector Database:**
+   - This project uses ChromaDB with a `PersistentClient`.
+   - Vector data and metadata are stored locally in the `./chroma_db` directory within the `backend`.
+
 ---
 
 ## Backend Setup
@@ -142,49 +146,46 @@ The system uses a frontend React application and a backend Flask server. The fro
 
 ## Frontend Workflow (`App.js` & `AssistantClass.js`)
 
-1.  **User Input:** User types a query into `QueryForm` and submits.
-2.  **Initiation (`App.js`):**
-    *   `handleQuerySubmit` is triggered.
-    *   User's query is added to the `ChatWindow` history.
-    *   Input field is cleared.
-    *   Overall progress bar is reset.
-3.  **Delegation to Concierge (`App.js`):**
-    *   `handleQuerySubmit` retrieves the `Concierge Assistant` instance.
-    *   It calls the `Concierge Assistant`'s `performTask` method, passing the query and callbacks (`setOverallProgress`, `updateChat`).
-4.  **Concierge Planning (`AssistantClass.js` - Concierge):**
-    *   The Concierge's `performTask` updates progress (`Analyzing query...`).
-    *   It makes a `POST` request to the backend `/api/generate_plan` endpoint, sending the user's query.
-    *   It updates progress while waiting (`Requesting plan...`, `Waiting for plan...`).
-5.  **Plan Presentation & Parsing (`AssistantClass.js` - Concierge):**
-    *   Upon receiving a successful response (`{ "plan": "..." }`) from `/api/generate_plan`:
-        *   The Concierge calls the `updateChat` callback to display the generated plan steps to the user.
-        *   It parses the plan text into a structured list of steps (task description, assistant name).
-        *   If parsing fails, it informs the user and stops.
-6.  **Plan Execution (`AssistantClass.js` - Concierge):**
-    *   The Concierge initializes an empty variable (`currentContextData`) to hold results passed between steps.
-    *   It iterates through the parsed steps.
-    *   For each step:
-        *   It updates the overall progress bar indicating the current step.
-        *   It retrieves the target assistant instance using `getAssistant`.
-        *   It prepares a payload for the target assistant, including the task description (as `query`) and the **current value of `currentContextData` (results from the previous step)**.
-        *   It calls the target assistant's `performTask` method with the payload and callbacks.
-        *   It **waits for the step to complete and captures the result returned by the assistant's `performTask` method into `currentContextData`**, overwriting the previous context.
-        *   If a step fails (indicated by the assistant's state or a thrown error), the execution loop stops, and an error is reported.
-7.  **Execution Completion (`AssistantClass.js` - Concierge):**
+1.  **Initialization:**
+    *   `App.js` loads the API specification from `src/assistants/geminiAiApi.json`. <!-- Updated path -->
+    *   State is initialized for selected model, method, and required input modalities (defaulting to `gemini-pro`, `generateContent`, `['text']`).
+2.  **User Interaction:**
+    *   User selects a Gemini model and method using dropdowns below the chat window.
+    *   `App.js` state (`selectedModel`, `selectedMethod`) is updated.
+    *   `useEffect` hooks update the available methods for the selected model and determine the `requiredInputs` based on the JSON spec for the selected model/method.
+    *   The `QueryForm` component receives the `requiredInputs` array as a prop.
+    *   `QueryForm` dynamically renders input fields (e.g., text area, image file input) based on the contents of `requiredInputs`.
+3.  **User Input & Submission:**
+    *   User fills the displayed input fields (text, selects an image, etc.).
+    *   User clicks "Submit".
+    *   `QueryForm`'s `onSubmit` creates a `formData` object containing the values from the rendered inputs (e.g., `{ text: '...', image: File }`).
+    *   `QueryForm` calls the `handleQuerySubmit` function in `App.js`, passing the `formData` object.
+4.  **Initiation (`App.js`):**
+    *   `handleQuerySubmit` receives the `formData`.
+    *   The text part of the query is added to the `ChatWindow`. (Image display not implemented).
+    *   Input fields are cleared. Progress bar reset.
+5.  **Delegation to Concierge (`App.js`):**
+    *   `handleQuerySubmit` retrieves the `Concierge Assistant`.
+    *   It creates a `taskPayload` containing the original `formData`, selected model/method details, and the primary text query.
+    *   It calls the `Concierge Assistant`'s `performTask` method with the `taskPayload` and callbacks.
+6.  **Concierge Planning (`AssistantClass.js` - Concierge):**
+    *   Receives the `taskPayload`.
+    *   Makes a `POST` request to `/api/generate_plan` (currently sending only the primary text query for planning).
+    *   Receives and displays the plan. Parses the plan.
+7.  **Plan Execution (`AssistantClass.js` - Concierge):**
+    *   Iterates through steps.
+    *   For each step, prepares a `stepPayload` including the task description and context from the previous step, **and potentially details from the original user request (`originalRequest`) if needed by the target assistant.**
+    *   Calls the target assistant's `performTask`. Captures the result.
+8.  **Execution Completion (`AssistantClass.js` - Concierge):**
     *   After successfully executing all steps:
         *   The Concierge updates the overall progress bar (`Plan execution finished.`).
         *   It adds a final completion message to the chat. (The final result from the last step might be implicitly shown via the last assistant's chat update, or the Concierge could explicitly display `currentContextData` if needed).
         *   It marks itself as complete.
-8.  **System Assistant Task Execution (`AssistantClass.js` - Target Assistant):**
-    *   The target assistant receives the payload, potentially including `contextData` (results from the previous step).
-    *   **If `Gemini API Admin`:** It includes the `contextData` as `external_context` in its request to `/api/query`.
-    *   **If `Internet Searcher`:** It calls `/api/search`. `contextData` might be ignored or used to refine the search query if implemented.
-    *   **If `ChromaDB Admin`:** It calls `/api/query` (for count). `contextData` is likely ignored.
-    *   **If `File Manager`:** Infers 'read' or 'list' operation, potentially extracts filename, calls `/api/file_operation`.
-    *   **If `Code Interpreter`:** Extracts code snippet, calls `/api/execute_code` **(INSECURE)**.
-    *   If assistant type is unknown/unimplemented, an error is thrown.
-    *   It performs its fetch request.
-9.  **Response Handling & Return (`AssistantClass.js` - Target Assistant):**
+9.  **System Assistant Task Execution (`AssistantClass.js` - Target Assistant):**
+    *   Receives the `stepPayload`. Extracts task query, context, and potentially original request details.
+    *   **If `ChromaDB Admin`:** Calls `/api/query` (backend infers count intent or performs retrieval based on the query). <!-- Clarified role -->
+    *   Other assistants (`Internet Searcher`, `File Manager`, `Code Interpreter`) use the `taskQuery` from the step payload to perform their actions via respective API calls.
+10. **Response Handling & Return (`AssistantClass.js` - Target Assistant):**
     *   The assistant receives the backend response.
     *   It processes the response based on its type (answer, search results, file list, file content, code output).
     *   It adds an appropriate message to the chat.
@@ -206,12 +207,16 @@ The system uses a frontend React application and a backend Flask server. The fro
 ## Backend Workflow (`app.py` - `/api/generate_plan`)
 
 1.  **Request Received:** Flask endpoint receives `POST` request with JSON body containing `query`.
-2.  **Load API Spec:** Attempts to load and parse `backend/gemini/documents/geminiAiApi.json`. It extracts a summary of the Gemini API's capabilities (e.g., function names and descriptions) from the JSON structure. If loading/parsing fails, it uses a default summary.
-3.  **Prepare Planning Prompt:** Constructs a detailed instruction for the LLM, asking it to break down the user's `query` into steps.
-    *   It lists the available assistant types (`Internet Searcher`, `File Manager`, `ChromaDB Admin`, `Gemini API Admin`, `Code Interpreter`).
-    *   **Crucially, it includes the specific capabilities summary loaded from `geminiAiApi.json` within the description of the `Gemini API Admin`.**
-    *   It instructs the LLM to pay attention to these specific capabilities when assigning tasks.
-4.  **LLM Call:** Calls `gemini.generate_response` with the planning instruction (no document context needed).
+2.  **Load API Spec:** Attempts to load and parse `backend/gemini/documents/geminiAiApi.json`. Extracts a summary of the Gemini API's capabilities.
+3.  **Prepare Planning Prompt:** Constructs a detailed instruction for the LLM.
+    *   It lists the available assistant types:
+        *   `Internet Searcher`: Searches the web.
+        *   `File Manager`: Reads/lists files in persistent storage.
+        *   **`ChromaDB Admin`**: Interacts with the local vector store (`./chroma_db`) via the backend to count items or retrieve relevant document chunks based on a query. <!-- Updated description -->
+        *   `Gemini API Admin`: Handles LLM tasks using loaded API capabilities.
+        *   `Code Interpreter`: Executes Python code (INSECURE).
+    *   It instructs the LLM to assign tasks appropriately.
+4.  **LLM Call:** Calls `gemini.generate_response` with the planning instruction.
 5.  **Validate Plan:** Performs a basic check on the LLM response.
 6.  **Return Response:** Returns `jsonify({'plan': plan_text})` or `jsonify({'error': error_message})`.
 

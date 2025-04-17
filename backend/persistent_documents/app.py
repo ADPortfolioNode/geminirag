@@ -37,7 +37,7 @@ os.makedirs(PERSISTENT_DOCUMENTS_DIR, exist_ok=True)
 try:
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
     collection = chroma_client.get_or_create_collection("rag_collection")
-    logging.info("ChromaDB client initialized using persistent storage at path: './chroma_db'. Collection 'rag_collection' retrieved/created.")
+    logging.info("ChromaDB client initialized using persistent storage and collection retrieved/created.")
 except Exception as e:
     logging.error(f"Failed to initialize ChromaDB: {e}")
     raise
