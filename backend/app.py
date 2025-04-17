@@ -127,7 +127,6 @@ def handle_query():
 
     query = data.get('query', '').strip()
     task_instruction = data.get('task_instruction', None)
-    # *** NEW: Get optional external context ***
     external_context = data.get('external_context', None) # Expecting a list of strings
     query_lower = query.lower()
     logging.info(f"Received query: '{query}' (Task: {task_instruction or 'Default'}, External Context: {'Yes' if external_context else 'No'})")
@@ -165,7 +164,7 @@ def handle_query():
         documents = []
         source_type = "none"
 
-        # *** Check for external context first ***
+        # Check for external context first
         if external_context and isinstance(external_context, list):
             logging.info(f"Using provided external context ({len(external_context)} items).")
             documents = external_context
@@ -212,7 +211,6 @@ def handle_query():
         logging.error(f"Error handling query '{query}': {e}", exc_info=True)
         return jsonify({'error': 'An internal error occurred while processing your query.'}), 500
 
-# --- NEW: Endpoint for Task Planning ---
 @app.route('/api/generate_plan', methods=['POST'])
 def generate_plan():
     data = request.json
@@ -268,7 +266,6 @@ def generate_plan():
         logging.error(f"[Plan] Error generating plan for query '{query}': {e}", exc_info=True)
         return jsonify({'error': 'An internal error occurred while generating the plan.'}), 500
 
-# --- NEW: Endpoint specifically for Internet Search ---
 @app.route('/api/search', methods=['POST'])
 def handle_search():
     data = request.json
