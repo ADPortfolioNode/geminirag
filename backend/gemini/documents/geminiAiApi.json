@@ -1,0 +1,145 @@
+{
+    "gemini-pro": {
+        "generateContent": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-pro:generateContent",
+            "description": "Generates text responses based on text input.",
+            "input_modality": [
+                "text"
+            ],
+            "output_modality": [
+                "text"
+            ]
+        },
+        "countTokens": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-pro:countTokens",
+            "description": "Counts the number of tokens in a text input.",
+            "input_modality": [
+                "text"
+            ],
+            "output_modality": [
+                "tokens"
+            ]
+        },
+        "embedContent": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-pro:embedContent",
+            "description": "Generates embeddings for text input.",
+            "input_modality": [
+                "text"
+            ],
+            "output_modality": [
+                "embedding"
+            ]
+        }
+    },
+    "gemini-pro-vision": {
+        "generateContent": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-pro-vision:generateContent",
+            "description": "Generates text responses based on text and image input.",
+            "input_modality": [
+                "text",
+                "image"
+            ],
+            "output_modality": [
+                "text"
+            ]
+        },
+        "countTokens": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-pro-vision:countTokens",
+            "description": "Counts the number of tokens in text and image input.",
+            "input_modality": [
+                "text",
+                "image"
+            ],
+            "output_modality": [
+                "tokens"
+            ]
+        },
+        "embedContent": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-pro-vision:embedContent",
+            "description": "Generates embeddings for text and image input.",
+            "input_modality": [
+                "text",
+                "image"
+            ],
+            "output_modality": [
+                "embedding"
+            ]
+        }
+    },
+    "gemini-1.5-pro": {
+        "generateContent": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-1.5-pro:generateContent",
+            "description": "Generates text responses based on multimodal input (text, image, audio, video, PDF).",
+            "input_modality": [
+                "text",
+                "image",
+                "audio",
+                "video",
+                "pdf"
+            ],
+            "output_modality": [
+                "text"
+            ]
+        },
+        "countTokens": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-1.5-pro:countTokens",
+            "description": "Counts the number of tokens in multimodal input (text, image, audio, video, PDF).",
+            "input_modality": [
+                "text",
+                "image",
+                "audio",
+                "video",
+                "pdf"
+            ],
+            "output_modality": [
+                "tokens"
+            ]
+        },
+        "embedContent": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-1.5-pro:embedContent",
+            "description": "Generates embeddings for multimodal input (text, image, audio, video, PDF).",
+            "input_modality": [
+                "text",
+                "image",
+                "audio",
+                "video",
+                "pdf"
+            ],
+            "output_modality": [
+                "embedding"
+            ]
+        }
+    },
+    "gemini-2.0-flash": {
+        "generateContent": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-2.0-flash:generateContent",
+            "description": "Generates text responses quickly based on text input.",
+            "input_modality": [
+                "text"
+            ],
+            "output_modality": [
+                "text"
+            ]
+        },
+        "countTokens": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-2.0-flash:countTokens",
+            "description": "Counts the number of tokens in a text input for the faster model.",
+            "input_modality": [
+                "text"
+            ],
+            "output_modality": [
+                "tokens"
+            ]
+        },
+        "embedContent": {
+            "endpoint": "https://ai.googleapis.com/v1beta1/models/gemini-2.0-flash:embedContent",
+            "description": "Generates embeddings for text input using the faster model.",
+            "input_modality": [
+                "text"
+            ],
+            "output_modality": [
+                "embedding"
+            ]
+        }
+    }
+}

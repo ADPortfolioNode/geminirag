@@ -180,13 +180,16 @@ The system uses a frontend React application and a backend Flask server. The fro
     *   **If `Gemini API Admin`:** It includes the `contextData` as `external_context` in its request to `/api/query`.
     *   **If `Internet Searcher`:** It calls `/api/search`. `contextData` might be ignored or used to refine the search query if implemented.
     *   **If `ChromaDB Admin`:** It calls `/api/query` (for count). `contextData` is likely ignored.
+    *   **If `File Manager`:** Infers 'read' or 'list' operation, potentially extracts filename, calls `/api/file_operation`.
+    *   **If `Code Interpreter`:** Extracts code snippet, calls `/api/execute_code` **(INSECURE)**.
+    *   If assistant type is unknown/unimplemented, an error is thrown.
     *   It performs its fetch request.
 9.  **Response Handling & Return (`AssistantClass.js` - Target Assistant):**
     *   The assistant receives the backend response.
-    *   It processes the response (`answer` or `results`).
-    *   It adds an appropriate message to the chat (e.g., final answer, summary, or confirmation of search completion like "Results passed to next step").
+    *   It processes the response based on its type (answer, search results, file list, file content, code output).
+    *   It adds an appropriate message to the chat.
     *   It updates its progress and marks itself complete.
-    *   **It returns its processed result (`taskResult`)** (e.g., the answer string, the list of search results) back to the calling Concierge, allowing it to be captured in `currentContextData`.
+    *   It returns its processed result (`taskResult`) back to the calling Concierge.
 
 ## Backend Workflow (`app.py` - `/api/query`)
 
@@ -203,16 +206,35 @@ The system uses a frontend React application and a backend Flask server. The fro
 ## Backend Workflow (`app.py` - `/api/generate_plan`)
 
 1.  **Request Received:** Flask endpoint receives `POST` request with JSON body containing `query`.
-2.  **Prepare Planning Prompt:** Constructs a detailed instruction for the LLM, asking it to break down the user's `query` into steps and suggest an appropriate assistant type (from a predefined list, including "Internet Searcher") for each step.
-3.  **LLM Call:** Calls `gemini.generate_response` with the planning instruction (no document context needed).
-4.  **Validate Plan:** Performs a basic check on the LLM response.
-5.  **Return Response:** Returns `jsonify({'plan': plan_text})` or `jsonify({'error': error_message})`.
+2.  **Load API Spec:** Attempts to load and parse `backend/gemini/documents/geminiAiApi.json`. It extracts a summary of the Gemini API's capabilities (e.g., function names and descriptions) from the JSON structure. If loading/parsing fails, it uses a default summary.
+3.  **Prepare Planning Prompt:** Constructs a detailed instruction for the LLM, asking it to break down the user's `query` into steps.
+    *   It lists the available assistant types (`Internet Searcher`, `File Manager`, `ChromaDB Admin`, `Gemini API Admin`, `Code Interpreter`).
+    *   **Crucially, it includes the specific capabilities summary loaded from `geminiAiApi.json` within the description of the `Gemini API Admin`.**
+    *   It instructs the LLM to pay attention to these specific capabilities when assigning tasks.
+4.  **LLM Call:** Calls `gemini.generate_response` with the planning instruction (no document context needed).
+5.  **Validate Plan:** Performs a basic check on the LLM response.
+6.  **Return Response:** Returns `jsonify({'plan': plan_text})` or `jsonify({'error': error_message})`.
 
 ## Backend Workflow (`app.py` - `/api/search`)
 
 1.  **Request Received:** Flask endpoint receives `POST` request with JSON body containing `query` and optional `num_results`.
 2.  **Call Search Function:** Calls `processing.perform_internet_search(query, num_results)`.
 3.  **Return Response:** Returns `jsonify({'results': list_of_strings})` on success or `jsonify({'error': error_message})` on failure.
+
+## Backend Workflow (`app.py` - `/api/file_operation`) **[NEW]**
+
+1.  **Request Received:** Flask endpoint receives `POST` request with JSON body containing `operation` ('list' or 'read') and optional `filename` (required for 'read').
+2.  **Perform Operation:**
+    *   **If 'list':** Reads filenames from `PERSISTENT_DOCUMENTS_DIR`.
+    *   **If 'read':** Reads the content (up to 10k chars) of the specified `filename` from `PERSISTENT_DOCUMENTS_DIR` after validation.
+3.  **Return Response:** Returns `jsonify({'files': [...]})` for list, `jsonify({'filename': ..., 'content': ...})` for read, or `jsonify({'error': ...})` on failure.
+
+## Backend Workflow (`app.py` - `/api/execute_code`) **[NEW & DANGEROUS]**
+
+1.  **Request Received:** Flask endpoint receives `POST` request with JSON body containing `code` snippet.
+2.  **Execute Code:** Uses Python's `exec()` function to run the provided `code_snippet`. **WARNING: THIS IS HIGHLY INSECURE.**
+3.  **Capture Output:** Redirects and captures `stdout` and `stderr` during execution.
+4.  **Return Response:** Returns `jsonify({'stdout': ..., 'stderr': ..., 'message': ..., 'error'?: ...})`.
 
 ## File Upload Workflow
 

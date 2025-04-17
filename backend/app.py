@@ -3,6 +3,9 @@ import uuid
 import logging
 import chromadb
 import shutil
+import io  # For capturing exec output
+import contextlib  # For capturing exec output
+import json  # For handling JSON
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -15,6 +18,7 @@ from processing import process_uploaded_file, perform_internet_search
 # === CONSTANTS ===
 UPLOAD_FOLDER = "uploads"
 PERSISTENT_DOCUMENTS_DIR = "persistent_documents"
+GEMINI_API_SPEC_PATH = os.path.join("gemini", "documents", "geminiAiApi.json")
 
 # === ENV INIT ===
 load_dotenv()
@@ -221,15 +225,43 @@ def generate_plan():
     query = data.get('query', '').strip()
     logging.info(f"[Plan] Received request to generate plan for query: '{query}'")
 
+    # --- Load Gemini API Spec ---
+    gemini_api_summary = "General text generation, summarization, and question answering." # Default summary
+    try:
+        if os.path.exists(GEMINI_API_SPEC_PATH):
+            with open(GEMINI_API_SPEC_PATH, 'r') as f:
+                api_spec = json.load(f)
+                # *** Generate a summary from the spec (adjust based on actual JSON structure) ***
+                capabilities = []
+                if 'functions' in api_spec: # Example: Assuming a 'functions' key
+                    for func_name, details in api_spec['functions'].items():
+                        desc = details.get('description', 'No description available.')
+                        capabilities.append(f"- {func_name}: {desc}")
+                elif 'models' in api_spec: # Alternative: Summarize models
+                     for model in api_spec['models']:
+                         capabilities.append(f"- Model '{model.get('name', 'N/A')}': {model.get('description', 'N/A')}")
+
+                if capabilities:
+                    gemini_api_summary = "Specific capabilities include:\n" + "\n".join(capabilities)
+                else:
+                    logging.warning(f"[Plan] Could not extract specific capabilities from {GEMINI_API_SPEC_PATH}. Using default summary.")
+            logging.info(f"[Plan] Loaded Gemini API spec summary from {GEMINI_API_SPEC_PATH}")
+        else:
+            logging.warning(f"[Plan] Gemini API spec file not found at {GEMINI_API_SPEC_PATH}. Using default summary.")
+    except (json.JSONDecodeError, OSError, Exception) as e:
+        logging.error(f"[Plan] Failed to load or parse Gemini API spec file {GEMINI_API_SPEC_PATH}: {e}", exc_info=True)
+        # Continue with the default summary if loading fails
+
+    # --- Prepare Planning Prompt ---
     try:
         # Define assistant types available for planning
-        # Keep this list updated if assistant capabilities change
         available_assistants = [
-            "Internet Searcher: Searches the web for current information on a specific topic.", # Clarify role
-            "File Manager: Reads, writes, or modifies files in the persistent storage.",
+            "Internet Searcher: Searches the web for current information on a specific topic.",
+            "File Manager: Reads files from or lists files in the persistent storage directory.",
             "ChromaDB Admin: Queries the vector database for relevant documents or counts items.",
-            "Gemini API Admin: Generates text, summarizes, answers questions based on context or general knowledge.",
-            "Code Interpreter: Executes Python code snippets (Use with caution!)."
+            # *** Integrate the loaded summary here ***
+            f"Gemini API Admin: Handles tasks related to the Google Gemini API. {gemini_api_summary}",
+            "Code Interpreter: Executes a given Python code snippet (Use with extreme caution!)."
         ]
         assistants_description = "\n".join([f"- {a}" for a in available_assistants])
 
@@ -237,6 +269,7 @@ def generate_plan():
         planning_instruction = (
             f"Based on the user's request, break it down into a sequence of logical steps. "
             f"For each step, identify the most appropriate assistant type from the following list to perform it. "
+            f"Pay close attention to the specific capabilities listed for the Gemini API Admin.\n" # Added emphasis
             f"Present the plan as a numbered list, clearly stating the step and the suggested assistant type.\n\n"
             f"Available Assistant Types:\n{assistants_description}\n\n"
             f"User Request: \"{query}\""
@@ -257,7 +290,6 @@ def generate_plan():
              logging.warning(f"[Plan] LLM did not return a valid-looking plan for query: '{query}'. Response: {plan_text}")
              # Fallback or error
              plan_text = "Sorry, I couldn't generate a detailed plan for that request."
-
 
         logging.info(f"[Plan] Generated plan for query '{query}'.")
         return jsonify({'plan': plan_text})
@@ -285,6 +317,116 @@ def handle_search():
     except Exception as e:
         logging.error(f"[Search] Error performing internet search for query '{query}': {e}", exc_info=True)
         return jsonify({'error': 'An internal error occurred while performing the search.'}), 500
+
+# --- NEW: Endpoint for File Operations ---
+@app.route('/api/file_operation', methods=['POST'])
+def handle_file_operation():
+    data = request.json
+    if not data or 'operation' not in data:
+        return jsonify({'error': 'Missing operation type (e.g., read, list) in request body.'}), 400
+
+    operation = data.get('operation', '').lower()
+    filename = data.get('filename', None) # Required for 'read'
+
+    logging.info(f"[FileOp] Received request for operation: '{operation}'" + (f" on file: '{filename}'" if filename else ""))
+
+    try:
+        if operation == 'list':
+            if not os.path.isdir(PERSISTENT_DOCUMENTS_DIR):
+                return jsonify({'error': f'Persistent documents directory not found: {PERSISTENT_DOCUMENTS_DIR}'}), 404
+            files = [f for f in os.listdir(PERSISTENT_DOCUMENTS_DIR)
+                     if os.path.isfile(os.path.join(PERSISTENT_DOCUMENTS_DIR, f)) and not f.startswith('.')]
+            logging.info(f"[FileOp] Listed {len(files)} files.")
+            return jsonify({'files': sorted(files)})
+
+        elif operation == 'read':
+            if not filename:
+                return jsonify({'error': "Missing 'filename' for read operation."}), 400
+
+            # Secure the filename again, although it should come from a plan
+            safe_filename = secure_filename(filename)
+            if not safe_filename or safe_filename != filename: # Basic check against path traversal attempts
+                 return jsonify({'error': 'Invalid filename provided for read operation.'}), 400
+
+            filepath = os.path.join(PERSISTENT_DOCUMENTS_DIR, safe_filename)
+
+            if not os.path.exists(filepath) or not os.path.isfile(filepath):
+                return jsonify({'error': f"File not found or is not accessible: '{safe_filename}'"}), 404
+
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    # Limit reading size to prevent loading huge files into memory/response
+                    content = f.read(10000) # Read max 10k characters
+                    if len(content) == 10000:
+                         content += "\n... (file content truncated)"
+                logging.info(f"[FileOp] Read content from '{safe_filename}'.")
+                return jsonify({'filename': safe_filename, 'content': content})
+            except Exception as read_err:
+                 logging.error(f"[FileOp] Error reading file '{safe_filename}': {read_err}", exc_info=True)
+                 return jsonify({'error': f"Could not read file: {read_err}"}), 500
+
+        # Add elif for 'write', 'delete' here if implementing (with extreme caution)
+
+        else:
+            return jsonify({'error': f"Unsupported file operation: '{operation}'. Supported: list, read."}), 400
+
+    except Exception as e:
+        logging.error(f"[FileOp] Unexpected error during file operation '{operation}': {e}", exc_info=True)
+        return jsonify({'error': 'An internal error occurred during the file operation.'}), 500
+
+
+# --- NEW: Endpoint for Code Execution (DANGEROUS) ---
+@app.route('/api/execute_code', methods=['POST'])
+def handle_execute_code():
+    # *** SERIOUS SECURITY WARNING ***
+    # This endpoint executes arbitrary Python code using exec().
+    # It provides NO SANDBOXING and is extremely insecure.
+    # DO NOT USE IN PRODUCTION OR SHARED ENVIRONMENTS.
+    # ONLY FOR LOCAL, TRUSTED DEVELOPMENT.
+    logging.warning("[CodeExec] Received request to execute code. THIS IS INSECURE.")
+
+    data = request.json
+    if not data or 'code' not in data:
+        return jsonify({'error': 'Missing Python code snippet in request body.'}), 400
+
+    code_snippet = data.get('code', '').strip()
+
+    if not code_snippet:
+         return jsonify({'error': 'Received empty code snippet.'}), 400
+
+    # Attempt to capture stdout/stderr during execution
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+
+    try:
+        # Use contextlib to redirect stdout/stderr
+        with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+            # Execute the code in a restricted global/local scope if possible,
+            # but exec itself is the main danger.
+            # Passing empty dicts provides *some* isolation but doesn't prevent access to builtins or imports.
+            exec(code_snippet, {}, {})
+
+        stdout_result = stdout_capture.getvalue()
+        stderr_result = stderr_capture.getvalue()
+
+        logging.info(f"[CodeExec] Executed code snippet. Stdout captured: {len(stdout_result)} chars, Stderr captured: {len(stderr_result)} chars.")
+
+        response_data = {
+            'stdout': stdout_result,
+            'stderr': stderr_result,
+            'message': 'Code executed successfully.' if not stderr_result else 'Code executed with errors.'
+        }
+        return jsonify(response_data)
+
+    except Exception as e:
+        stderr_result = stderr_capture.getvalue() # Get any stderr captured before the exception
+        error_message = f"Execution failed: {type(e).__name__}: {e}"
+        logging.error(f"[CodeExec] Error executing code snippet: {error_message}", exc_info=False) # Avoid logging full trace unless needed
+        return jsonify({
+            'stdout': stdout_capture.getvalue(),
+            'stderr': f"{stderr_result}\n{error_message}", # Combine captured stderr with exception
+            'error': error_message
+        }), 500 # Use 500 for execution failure
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
