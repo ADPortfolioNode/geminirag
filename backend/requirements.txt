@@ -1,12 +1,23 @@
+# Core Flask App
 flask
 flask-cors
 python-dotenv
+
+# Database
+chromadb
+
+# LLM API
+google-generativeai
+
+# File Processing
+SpeechRecognition
 moviepy
-speechrecognition
-imageio-ffmpeg
-chromadb>=0.4.15
-langchain
-langchain-chroma
-langchain-community
-langchain-google-genai
-google-generativeai 
+unstructured[pdf] # Installs unstructured and extras for PDF
+langchain-community # For DirectoryLoader
+langchain # For CharacterTextSplitter
+pydub # Often needed for audio processing
+
+# NOTE: ffmpeg is required by moviepy but must be installed separately on the system.
+# Example (Ubuntu/Debian): sudo apt update && sudo apt install ffmpeg
+# Example (macOS with Homebrew): brew install ffmpeg
+# Example (Windows): Download from ffmpeg.org and add to PATH

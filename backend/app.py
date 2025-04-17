@@ -1,166 +1,198 @@
 import os
 import uuid
 import logging
-import datetime
-import time
 import chromadb
-import speech_recognition as sr
+import shutil
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-from moviepy import VideoFileClip
-from threading import Lock
+from werkzeug.utils import secure_filename
 
-import google.generativeai as genai
-from tqdm import tqdm
-from langchain_community.document_loaders import DirectoryLoader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from langchain_chroma import Chroma
-from chromadb.utils import embedding_functions
-from langchain_google_genai import GoogleGenerativeAI
-from langchain.chains import RetrievalQA
-from langchain_core.embeddings import Embeddings
+from gemini import GeminiAPI
+from processing import process_uploaded_file, perform_internet_search
+
+# === CONSTANTS ===
+UPLOAD_FOLDER = "uploads"
+PERSISTENT_DOCUMENTS_DIR = "persistent_documents"
 
 # === ENV INIT ===
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise Exception("Missing GOOGLE_API_KEY")
 
 # === APP INIT ===
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Allow requests from the frontend origin
+CORS(app, resources={r"/*": {"origins": "*"}})
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(PERSISTENT_DOCUMENTS_DIR, exist_ok=True)
 
-# === STATUS TRACKING ===
-query_status_map = {}
-status_lock = Lock()
-
-# === EMBEDDING WRAPPER ===
-class SentenceTransformerWrapper(Embeddings):
-    def __init__(self, model_name="all-mpnet-base-v2"):
-        self._ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
-    def embed_documents(self, texts):
-        return self._ef(texts)
-    def embed_query(self, text):
-        return self._ef([text])[0]
-
-# === VECTORSTORE SETUP ===
-embedding_function = SentenceTransformerWrapper()
-chroma_client = chromadb.PersistentClient(path="chroma_db")
-vectordb = Chroma(
-    client=chroma_client,
-    collection_name="documents_collection",
-    embedding_function=embedding_function
-)
-
-# === LLM SETUP WITH FAILSAFE ===
-genai.configure(api_key=GOOGLE_API_KEY)
-
-# Define a list of compatible models for GoogleGenerativeAI
-compatible_models = [
-    "models/gemini-1.5-pro-001",
-    "models/gemini-1.5-pro-002",
-    "models/gemini-2.0-flash",
-    "models/gemini-2.0-flash-001",
-    "models/gemini-2.0-pro-exp",
-    # Add other compatible models as needed
-]
-
-# Fetch available models and validate the model name
+# Initialize ChromaDB Client and Collection
 try:
-    available_models = genai.list_models()
-    if not available_models:
-        logging.error("[LLM Setup] No models returned by the API. Check your API key and permissions.")
-        raise Exception("No models available in the Generative AI API.")
-
-    # Log the raw structure of the models for debugging
-    logging.info(f"[LLM Setup] Raw model data: {available_models}")
-
-    # Extract model details based on the actual structure of the objects
-    model_details = [
-        {"name": getattr(model, 'name', None), "methods": getattr(model, 'supportedMethods', [])}
-        for model in available_models
-    ]
-    logging.info(f"[LLM Setup] Available models and their supported methods: {model_details}")
-
-    # Select the first compatible model from the available models
-    selected_model = next(
-        (model['name'] for model in model_details if model['name'] in compatible_models),
-        None
-    )
-    if not selected_model:
-        logging.warning("[LLM Setup] No compatible models found. Using a hardcoded fallback model.")
-        selected_model = "models/gemini-1.5-pro-001"  # Replace with a valid fallback model if known
+    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    collection = chroma_client.get_or_create_collection("rag_collection")
+    logging.info("ChromaDB client initialized using persistent storage and collection retrieved/created.")
 except Exception as e:
-    logging.error(f"[LLM Setup] Failed to fetch models: {e}")
-    # Failsafe: Use a hardcoded default model or disable LLM functionality
-    selected_model = "models/gemini-1.5-pro-001"  # Replace with a valid fallback model if known
-    logging.warning(f"[LLM Setup] Failsafe activated. Using fallback model: {selected_model}")
+    logging.error(f"Failed to initialize ChromaDB: {e}")
+    raise
 
-try:
-    llm = GoogleGenerativeAI(
-        model=selected_model,
-        temperature=0.7,
-        top_p=0.95,
-        max_output_tokens=2048
-    )
-    logging.info(f"[LLM Setup] Using model: {selected_model}")
-except Exception as e:
-    logging.error(f"[LLM Setup] Failed to initialize LLM with model '{selected_model}': {e}")
-    raise Exception("Critical error: Unable to configure the LLM.")
+class ChromaDBWrapper:
+    def __init__(self, collection_instance):
+        self.collection = collection_instance
 
-# === QA CHAIN ===
-PROMPT = PromptTemplate(
-    template="""You are a helpful assistant. Use the following context to answer the question at the end. If you don't know, say so.
+    def retrieve(self, query, n_results=5):
+        try:
+            results = self.collection.query(query_texts=[query], n_results=n_results, include=['documents', 'metadatas'])
+            retrieved_docs = results.get("documents", [[]])[0]
+            return retrieved_docs
+        except Exception as e:
+            logging.error(f"Error retrieving from ChromaDB: {e}", exc_info=True)
+            return []
 
-Context:
-{context}
+    def add_texts(self, texts, metadatas):
+        if not texts:
+            logging.warning("Attempted to add empty list of texts.")
+            return
+        try:
+            ids = [str(uuid.uuid4()) for _ in texts]
+            self.collection.add(
+                documents=texts,
+                metadatas=metadatas,
+                ids=ids
+            )
+            logging.info(f"Added {len(texts)} text segments to ChromaDB.")
+        except Exception as e:
+            logging.error(f"Error adding texts to ChromaDB: {e}", exc_info=True)
 
-Question: {question}
-Helpful Answer:""",
-    input_variables=["context", "question"]
-)
+    def add_documents(self, docs):
+        if not docs:
+            logging.warning("Attempted to add empty list of documents.")
+            return
+        try:
+            texts = [getattr(doc, "page_content", "") for doc in docs]
+            metadatas = [getattr(doc, "metadata", {}) for doc in docs]
+            ids = [str(uuid.uuid4()) for _ in docs]
+            self.collection.add(
+                documents=texts,
+                metadatas=metadatas,
+                ids=ids
+            )
+            logging.info(f"Added {len(docs)} documents to ChromaDB.")
+        except Exception as e:
+            logging.error(f"Error adding documents to ChromaDB: {e}", exc_info=True)
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever=vectordb.as_retriever(search_kwargs={"k": 3}),
-    return_source_documents=True,
-    chain_type_kwargs={"prompt": PROMPT}
-)
+    def get_all_document_sources(self):
+        try:
+            results = self.collection.get(include=["metadatas"])
+            sources = set()
+            if results and results.get("metadatas"):
+                for meta in results["metadatas"]:
+                    if meta and 'source' in meta:
+                        source_val = meta['source']
+                        if isinstance(source_val, str):
+                            sources.add(source_val)
+                        else:
+                            logging.warning(f"Found non-string source metadata: {source_val}")
+            logging.info(f"Retrieved {len(sources)} distinct document sources.")
+            return sorted(list(sources))
+        except Exception as e:
+            logging.error(f"Error getting document sources from ChromaDB: {e}", exc_info=True)
+            return []
 
-# === MULTIMEDIA EXTRACTION ===
-def extract_text_from_multimedia(file_path):
+    def count_documents(self):
+        """Counts the total number of documents in the collection."""
+        try:
+            count = self.collection.count()
+            logging.info(f"Counted {count} documents in ChromaDB.")
+            return count
+        except Exception as e:
+            logging.error(f"Error counting documents in ChromaDB: {e}", exc_info=True)
+            return -1
+
+chromadb_wrapper = ChromaDBWrapper(collection)
+gemini = GeminiAPI(api_key=GOOGLE_API_KEY)
+
+# Keywords to infer document count intent
+COUNT_KEYWORDS = {"how many", "count", "number of", "total", "amount"}
+DOCUMENT_KEYWORDS = {"document", "documents", "file", "files", "item", "items", "entry", "entries", "indexed", "stored", "saved", "encoded", "collection"}
+
+@app.route('/api/query', methods=['POST'])
+def handle_query():
+    data = request.json
+    if not data or 'query' not in data:
+        logging.warning("Received query request with missing data or query field.")
+        return jsonify({'error': 'Missing query in request body.'}), 400
+
+    query = data.get('query', '').strip()
+    # Get optional task instruction from request
+    task_instruction = data.get('task_instruction', None)
+    query_lower = query.lower()
+    logging.info(f"Received query: '{query}' (Task: {task_instruction or 'Default'})")
+
+    # --- Intent Inference for Document Count ---
+    # Check if it's explicitly a count query *before* RAG
+    is_count_query = False
+    if not task_instruction: # Only infer count if no specific task is given
+        contains_count_keyword = any(keyword in query_lower for keyword in COUNT_KEYWORDS)
+        contains_doc_keyword = any(keyword in query_lower for keyword in DOCUMENT_KEYWORDS)
+        if contains_count_keyword and contains_doc_keyword:
+             is_count_query = True
+
+    if is_count_query:
+        logging.info("Inferred intent: Document count query.")
+        try:
+            count = chromadb_wrapper.count_documents()
+            if count != -1:
+                if count == 0:
+                    answer = "There are currently no documents indexed."
+                elif count == 1:
+                    answer = "There is currently 1 document indexed."
+                else:
+                    answer = f"There are currently {count} documents indexed."
+                return jsonify({'answer': answer})
+            else:
+                return jsonify({'error': 'Sorry, I encountered an issue trying to count the documents.'}), 500
+        except Exception as e:
+            logging.error(f"Error handling inferred document count query: {e}", exc_info=True)
+            return jsonify({'error': 'An internal error occurred while counting documents.'}), 500
+    # --- End Intent Inference ---
+
+    # --- RAG Workflow with Internet Fallback & Task Instruction ---
     try:
-        if file_path.endswith(('.mp4', '.avi', '.mov')):
-            video = VideoFileClip(file_path)
-            audio_path = file_path.replace(file_path.split('.')[-1], 'wav')
-            video.audio.write_audiofile(audio_path)
-            file_path = audio_path
+        logging.info("Step 1: Retrieving documents from ChromaDB...")
+        # Increase n_results slightly for more context?
+        chroma_documents = chromadb_wrapper.retrieve(query, n_results=7)
 
-        if file_path.endswith(('.mp3', '.wav', '.ogg')):
-            recognizer = sr.Recognizer()
-            with sr.AudioFile(file_path) as source:
-                audio_data = recognizer.record(source)
-                return recognizer.recognize_google(audio_data)
+        # *** ADD LOGGING HERE ***
+        if chroma_documents:
+            logging.info(f"Found {len(chroma_documents)} relevant document chunks in ChromaDB.")
+            # Log snippets for verification (optional, can be verbose)
+            for i, doc in enumerate(chroma_documents):
+                 logging.debug(f"  Doc {i+1}: {doc[:100]}...") # Log first 100 chars
+            # Pass task_instruction to generate_response
+            answer = gemini.generate_response(query, chroma_documents, source_type="documents", task_instruction=task_instruction)
+        else:
+            # Fallback logic remains the same
+            logging.info("No relevant documents found in ChromaDB. Step 2: Performing internet search...")
+            internet_results = perform_internet_search(query)
 
-        if file_path.endswith('.pdf'):
-            try:
-                from unstructured.partition.pdf import partition_pdf
-                elements = partition_pdf(file_path)
-                return "\n".join([str(element) for element in elements])
-            except ImportError:
-                logging.error("[PDF Processing] Missing dependencies for partition_pdf(). Install with: pip install 'unstructured[pdf]'")
-                return "Error: Missing dependencies for PDF processing."
+            if internet_results:
+                logging.info(f"Found {len(internet_results)} results from internet search.")
+                answer = gemini.generate_response(query, internet_results, source_type="internet", task_instruction=task_instruction)
+            else:
+                logging.info("No relevant results found from internet search. Step 3: Generating response from general knowledge.")
+                answer = gemini.generate_response(query, [], source_type="none", task_instruction=task_instruction)
+
+        logging.info(f"Generated answer for query '{query}'.")
+        return jsonify({'answer': answer})
+
     except Exception as e:
-        logging.error(f"[Multimedia] {e}")
-        return ""
+        logging.error(f"Error handling query '{query}': {e}", exc_info=True)
+        return jsonify({'error': 'An internal error occurred while processing your query.'}), 500
 
-# === UPLOAD ENDPOINT ===
-@app.route("/api/upload", methods=["POST"])
+@app.route('/api/upload', methods=['POST'])
 def upload_file():
     if 'file' not in request.files:
         logging.error("[Upload] No file part in the request.")
@@ -171,148 +203,64 @@ def upload_file():
         logging.error("[Upload] No file selected for upload.")
         return jsonify({'error': 'No file selected for upload.'}), 400
 
+    filename = secure_filename(file.filename)
+    if not filename:
+        logging.error("[Upload] Invalid filename provided.")
+        return jsonify({'error': 'Invalid filename provided.'}), 400
+
+    logging.info(f"Received file upload (secured name): {filename}")
+
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    persistent_filepath = os.path.join(PERSISTENT_DOCUMENTS_DIR, filename)
+    if os.path.exists(persistent_filepath):
+        logging.warning(f"File '{filename}' already exists in persistent storage. Aborting upload.")
+        return jsonify({'error': f"File '{filename}' already exists. Please rename and upload again."}), 409
+
     try:
-        # Ensure the uploads directory exists
-        os.makedirs("uploads", exist_ok=True)
-        filepath = os.path.join("uploads", file.filename)
         file.save(filepath)
+        logging.info(f"File saved temporarily to: {filepath}")
 
-        ext = filepath.split('.')[-1].lower()
-        if ext in ('mp4', 'avi', 'mov', 'mp3', 'wav', 'ogg'):
-            # Process multimedia files
-            text = extract_text_from_multimedia(filepath)
-            if text:
-                vectordb.add_texts([text], metadatas=[{"source": file.filename}])
-                logging.info(f"[Upload] Multimedia file processed: {file.filename}")
-            else:
-                logging.warning(f"[Upload] No text extracted from multimedia file: {file.filename}")
-        elif ext == 'pdf':
-            # Process PDF files
-            try:
-                from unstructured.partition.pdf import partition_pdf
-                elements = partition_pdf(filepath)
-                text = "\n".join([str(element) for element in elements])
-                vectordb.add_texts([text], metadatas=[{"source": file.filename}])
-                logging.info(f"[Upload] PDF file processed: {file.filename}")
-            except ImportError:
-                logging.error("[Upload] Missing dependencies for PDF processing. Install with: pip install 'unstructured[pdf]'")
-                return jsonify({'error': 'Missing dependencies for PDF processing. Install with: pip install "unstructured[pdf]"'}), 500
+        success, message = process_uploaded_file(
+            filepath,
+            filename,
+            chromadb_wrapper,
+            PERSISTENT_DOCUMENTS_DIR
+        )
+
+        if success:
+            logging.info(f"Successfully processed and moved file: {filename}")
+            return jsonify({'message': message}), 200
         else:
-            # Process other text-based files
-            loader = DirectoryLoader("uploads", glob="**/*")
-            documents = loader.load()
-            splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-            split_docs = splitter.split_documents(documents)
-            vectordb.add_documents(split_docs)
-            logging.info(f"[Upload] Text-based file processed: {file.filename}")
-
-        return jsonify({'message': '✅ File uploaded & processed successfully.'}), 200
-
+            logging.warning(f"Failed to process file: {filename}. Reason: {message}")
+            status_code = 500 if "internal error" in message.lower() else 400
+            if "Missing dependencies" in message:
+                status_code = 501
+            return jsonify({'error': message}), status_code
     except Exception as e:
-        logging.error(f"[Upload] An error occurred while processing the file: {e}", exc_info=True)
-        return jsonify({'error': 'An error occurred while processing the file. Please try again later.'}), 500
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                logging.info(f"Cleaned up temporary file after upload error: {filepath}")
+            except Exception as cleanup_error:
+                logging.error(f"Error cleaning up file {filepath} after upload error: {cleanup_error}")
+        logging.error(f"[Upload] An unexpected error occurred for file {filename}: {e}", exc_info=True)
+        return jsonify({'error': 'An unexpected internal error occurred during upload.'}), 500
 
-# === QUERY ENDPOINT WITH PER-REQUEST STATUS ===
-@app.route("/api/query", methods=["POST"])
-def query():
-    data = request.get_json()
-    if not data:
-        logging.error("[Query] No JSON payload received.")
-        return jsonify({"error": "Invalid request. No JSON payload received."}), 400
-
-    query_text = data.get("query", "").strip()
-    if not query_text:
-        logging.error("[Query] No query provided in the request.")
-        return jsonify({"error": "No query provided"}), 400
-
-    query_id = str(uuid.uuid4())
-    with status_lock:
-        query_status_map[query_id] = {"phase": "loading", "progress": 10}
-
-    try:
-        logging.info(f"[Query] Processing query: {query_text}")
-
-        for _ in tqdm(range(3)):
-            time.sleep(0.3)
-
-        with status_lock:
-            query_status_map[query_id] = {"phase": "retrieving", "progress": 50}
-
-        result = qa_chain.invoke({"query": query_text})
-        if not result:
-            raise ValueError("No result returned from QA chain.")
-
-        answer = result.get("result", "No answer found.")
-        sources = [
-            doc.metadata.get("source", "unknown") for doc in result.get("source_documents", [])
-        ]
-
-        with status_lock:
-            query_status_map[query_id] = {"phase": "done", "progress": 100}
-
-        logging.info(f"[Query] Query processed successfully. ID: {query_id}")
-        return jsonify({
-            "id": query_id,
-            "answer": answer,
-            "sources": sources
-        })
-
-    except google.generativeai.exceptions.ResourceExhausted as e:
-        logging.error(f"[Query Error] Quota exceeded: {e}")
-        return jsonify({"error": "Quota exceeded. Please check your plan and billing details."}), 429
-
-    except Exception as e:
-        logging.error(f"[Query Error] {e}", exc_info=True)
-        with status_lock:
-            query_status_map[query_id] = {"phase": "error", "progress": 0}
-        return jsonify({"error": "An error occurred while processing the query. Please try again later."}), 500
-
-# === STATUS ENDPOINT ===
-@app.route("/api/result/<query_id>", methods=["GET"])
-def get_result(query_id):
-    global query_status_map
-    result = query_status_map.get(query_id)
-    if not result:
-        logging.error(f"[Result] Query ID {query_id} not found in result map.")
-        return jsonify({"error": "Result not found"}), 404
-    return jsonify(result)
-
-@app.route("/api/query_status/<query_id>", methods=["GET"])
-def get_query_status(query_id):
-    with status_lock:
-        status = query_status_map.get(query_id, {"phase": "unknown", "progress": 0})
-    return jsonify(status)
-
-@app.route("/api/status", methods=["GET"])
-def get_system_status():
-    return jsonify({"status": "Server is running", "uptime": "24 hours"}), 200
-
-# === DOCUMENT LISTING ===
-@app.route("/api/documents", methods=["GET"])
+@app.route('/api/documents', methods=['GET'])
 def get_documents():
+    """Returns a list of filenames from the persistent documents directory."""
     try:
-        uploads_dir = "uploads"
-        if not os.path.exists(uploads_dir):
+        if not os.path.isdir(PERSISTENT_DOCUMENTS_DIR):
+            logging.warning(f"Persistent documents directory not found: {PERSISTENT_DOCUMENTS_DIR}")
             return jsonify([])
 
-        documents = []
-        for filename in os.listdir(uploads_dir):
-            file_path = os.path.join(uploads_dir, filename)
-            if os.path.isfile(file_path):
-                upload_time = datetime.datetime.fromtimestamp(os.path.getctime(file_path))
-                documents.append({
-                    "name": filename,
-                    "type": filename.split(".")[-1].upper(),
-                    "uploadDate": upload_time.strftime("%Y-%m-%d %H:%M:%S")
-                })
-
-        return jsonify(documents)
+        files = [f for f in os.listdir(PERSISTENT_DOCUMENTS_DIR)
+                 if os.path.isfile(os.path.join(PERSISTENT_DOCUMENTS_DIR, f)) and not f.startswith('.')]
+        logging.info(f"Retrieved {len(files)} files from {PERSISTENT_DOCUMENTS_DIR}.")
+        return jsonify(sorted(files))
     except Exception as e:
-        logging.error(f"[Documents] {e}")
-        return jsonify({"error": "Failed to fetch documents."}), 500
+        logging.error(f"Error retrieving document list from filesystem: {e}", exc_info=True)
+        return jsonify({'error': 'Failed to retrieve document list.'}), 500
 
-# === LAUNCH SERVER ===
-if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.freeze_support()
-    app.run(debug=True, port=5000, use_reloader=False)
+if __name__ == '__main__':
+    app.run(debug=True, port=5000, use_reloader=True)
