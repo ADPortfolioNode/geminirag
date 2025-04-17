@@ -192,6 +192,63 @@ def handle_query():
         logging.error(f"Error handling query '{query}': {e}", exc_info=True)
         return jsonify({'error': 'An internal error occurred while processing your query.'}), 500
 
+# --- NEW: Endpoint for Task Planning ---
+@app.route('/api/generate_plan', methods=['POST'])
+def generate_plan():
+    data = request.json
+    if not data or 'query' not in data:
+        logging.warning("[Plan] Received plan request with missing data or query field.")
+        return jsonify({'error': 'Missing query in request body.'}), 400
+
+    query = data.get('query', '').strip()
+    logging.info(f"[Plan] Received request to generate plan for query: '{query}'")
+
+    try:
+        # Define assistant types available for planning
+        # Keep this list updated if assistant capabilities change
+        available_assistants = [
+            "Internet Searcher: Searches the web for current information.",
+            "File Manager: Reads, writes, or modifies files in the persistent storage.",
+            "ChromaDB Admin: Queries the vector database for relevant documents or counts items.",
+            "Gemini API Admin: Generates text, summarizes, answers questions based on context or general knowledge.",
+            "Code Interpreter: Executes Python code snippets (Use with caution!)."
+            # Exclude Concierge, Flask Admin, Function Caller unless they have specific plannable actions
+        ]
+        assistants_description = "\n".join([f"- {a}" for a in available_assistants])
+
+        # Instruction for the LLM to generate a plan
+        planning_instruction = (
+            f"Based on the user's request, break it down into a sequence of logical steps. "
+            f"For each step, identify the most appropriate assistant type from the following list to perform it. "
+            f"Present the plan as a numbered list, clearly stating the step and the suggested assistant type.\n\n"
+            f"Available Assistant Types:\n{assistants_description}\n\n"
+            f"User Request: \"{query}\""
+        )
+
+        # Use the Gemini client to generate the plan (no context needed)
+        # We use the 'query' parameter here mainly for logging consistency in generate_response
+        # The actual instruction is in 'task_instruction'
+        plan_text = gemini.generate_response(
+            query=f"Plan for: {query}", # For logging/tracking
+            documents=[],
+            source_type="none",
+            task_instruction=planning_instruction
+        )
+
+        # Basic check if the response looks like a plan (contains numbers, etc.)
+        if not plan_text or not any(char.isdigit() for char in plan_text):
+             logging.warning(f"[Plan] LLM did not return a valid-looking plan for query: '{query}'. Response: {plan_text}")
+             # Fallback or error
+             plan_text = "Sorry, I couldn't generate a detailed plan for that request."
+
+
+        logging.info(f"[Plan] Generated plan for query '{query}'.")
+        return jsonify({'plan': plan_text})
+
+    except Exception as e:
+        logging.error(f"[Plan] Error generating plan for query '{query}': {e}", exc_info=True)
+        return jsonify({'error': 'An internal error occurred while generating the plan.'}), 500
+
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     if 'file' not in request.files:
@@ -202,6 +259,11 @@ def upload_file():
     if file.filename == '':
         logging.error("[Upload] No file selected for upload.")
         return jsonify({'error': 'No file selected for upload.'}), 400
+
+    # Get optional context from form data
+    file_context = request.form.get('context', None) # Use request.form for non-file fields
+    if file_context:
+        logging.info(f"Received file context: '{file_context}'")
 
     filename = secure_filename(file.filename)
     if not filename:
@@ -220,11 +282,13 @@ def upload_file():
         file.save(filepath)
         logging.info(f"File saved temporarily to: {filepath}")
 
+        # Pass context to processing function
         success, message = process_uploaded_file(
             filepath,
             filename,
             chromadb_wrapper,
-            PERSISTENT_DOCUMENTS_DIR
+            PERSISTENT_DOCUMENTS_DIR,
+            file_context=file_context # Pass the context
         )
 
         if success:

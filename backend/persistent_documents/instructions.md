@@ -151,29 +151,42 @@ The system uses a frontend React application and a backend Flask server. The fro
 3.  **Delegation to Concierge (`App.js`):**
     *   `handleQuerySubmit` retrieves the `Concierge Assistant` instance.
     *   It calls the `Concierge Assistant`'s `performTask` method, passing the query and callbacks (`setOverallProgress`, `updateChat`).
-4.  **Concierge Planning (`AssistantClass.js` - Concierge):**
-    *   The Concierge's `performTask` updates progress (`Analyzing query...`).
-    *   It makes a `POST` request to the backend `/api/generate_plan` endpoint, sending the user's query.
-    *   It updates progress while waiting (`Requesting plan...`, `Waiting for plan...`).
-5.  **Plan Presentation (`AssistantClass.js` - Concierge):**
-    *   Upon receiving a successful response (`{ "plan": "..." }`) from `/api/generate_plan`:
-        *   The Concierge calls the `updateChat` callback to display the generated plan steps to the user.
-        *   It calls `updateChat` again to ask the user for confirmation (currently non-interactive).
-        *   It updates progress to 100% (`Plan presented...`) and marks itself as complete.
-    *   If plan generation fails, an error message is added to the chat, progress is set to 0%, and the task stops.
-6.  **~~Concierge Delegation~~ (Deferred):** The workflow currently stops after presenting the plan. The previous delegation logic based on simple keywords is bypassed.
-7.  **~~System Assistant Task Execution~~ (Deferred):** System assistants are not called by the Concierge in this planning phase.
-8.  **~~Response Handling~~ (Deferred):** Direct RAG/Count responses are not generated in this planning phase.
-
-*(Note: The following steps describe the previous direct execution flow, which is currently bypassed by the Concierge's planning step)*
-*   ~~**Concierge Delegation (`AssistantClass.js` - Concierge):** Based on the intent, it identifies the target system assistant...~~
-*   ~~**System Assistant Task Execution (`AssistantClass.js` - Target Assistant):** The target assistant (`ChromaDB Admin` or `Gemini API Admin`) receives the payload...~~
-*   ~~**Response Handling (`AssistantClass.js` - Target Assistant):** The assistant receives the JSON response from the backend...~~
-*   ~~**Concierge Completion (`AssistantClass.js` - Concierge):** After the delegated task finishes...~~
+4.  **Concierge Analysis (`AssistantClass.js` - Concierge):**
+    *   The Concierge's `performTask` analyzes the query text.
+    *   It determines the primary intent:
+        *   **Count Query:** If keywords like "how many", "count", "documents" are present.
+        *   **Summarization/Topic Query:** If keywords like "summarize", "what topics" are present along with "document" or "context".
+        *   **Default RAG Query:** For all other cases.
+    *   It updates the overall progress bar (`Concierge: Analyzing query...`).
+5.  **Concierge Delegation (`AssistantClass.js` - Concierge):**
+    *   Based on the intent, it identifies the target system assistant:
+        *   `ChromaDB Admin` for count queries.
+        *   `Gemini API Admin` for summarization, topic extraction, or default RAG.
+    *   It may generate a specific `taskInstruction` string (e.g., "Summarize the main points...").
+    *   It updates the overall progress bar (`Concierge: Delegating...`).
+    *   It calls the target system assistant's `performTask` method, passing a payload object `{ query, taskInstruction }` and the original callbacks.
+6.  **System Assistant Task Execution (`AssistantClass.js` - Target Assistant):**
+    *   The target assistant (`ChromaDB Admin` or `Gemini API Admin`) receives the payload.
+    *   It updates the overall progress bar (`AssistantName: Preparing request...`).
+    *   It constructs the JSON body for the backend API call, including `query` and `task_instruction`.
+    *   It makes a `POST` request to the backend `/api/query` endpoint using `fetch`.
+    *   It updates the overall progress bar (`AssistantName: Sending request...`, `AssistantName: Waiting for response...`).
+7.  **Response Handling (`AssistantClass.js` - Target Assistant):**
+    *   The assistant receives the JSON response from the backend.
+    *   **On Success:**
+        *   It extracts the `answer` from the response.
+        *   It calls the `updateChat` callback to add the answer to the `ChatWindow`.
+        *   It calls `setOverallProgress` to set progress to 100% and display a success message.
+    *   **On Failure:**
+        *   It extracts the `error` message.
+        *   It calls the `updateChat` callback to add the error message to the `ChatWindow`.
+        *   It calls `setOverallProgress` to set progress to 0% and display a failure message.
+    *   The assistant marks itself as complete.
+8.  **Concierge Completion (`AssistantClass.js` - Concierge):**
+    *   After the delegated task finishes (success or failure), control returns to the Concierge's `performTask`.
+    *   The Concierge updates the overall progress bar (`Concierge: Delegation complete.`) and marks itself as complete.
 
 ## Backend Workflow (`app.py` - `/api/query`)
-
-*(This endpoint is currently only called directly if bypassing the Concierge's planning step)*
 
 1.  **Request Received:** Flask endpoint receives the `POST` request with JSON body containing `query` and optional `task_instruction`.
 2.  **Count Intent Check:**
@@ -201,14 +214,6 @@ The system uses a frontend React application and a backend Flask server. The fro
     *   Parse the response from the Gemini model.
     *   Append source information (e.g., "(Source: Internal Documents)") based on `source_type`.
 8.  **Return Response:** Return `jsonify({'answer': final_answer})` or `jsonify({'error': error_message})` in case of exceptions.
-
-## Backend Workflow (`app.py` - `/api/generate_plan`) **[NEW]**
-
-1.  **Request Received:** Flask endpoint receives `POST` request with JSON body containing `query`.
-2.  **Prepare Planning Prompt:** Constructs a detailed instruction for the LLM, asking it to break down the user's `query` into steps and suggest an appropriate assistant type (from a predefined list) for each step.
-3.  **LLM Call:** Calls `gemini.generate_response` with the planning instruction (no document context needed).
-4.  **Validate Plan:** Performs a basic check on the LLM response.
-5.  **Return Response:** Returns `jsonify({'plan': plan_text})` or `jsonify({'error': error_message})`.
 
 ## File Upload Workflow
 

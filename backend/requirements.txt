@@ -17,6 +17,9 @@ langchain-community # For DirectoryLoader
 langchain # For CharacterTextSplitter
 pydub # Often needed for audio processing
 
+# HTTP Requests
+requests # Add requests library for internet search
+
 # NOTE: ffmpeg is required by moviepy but must be installed separately on the system.
 # Example (Ubuntu/Debian): sudo apt update && sudo apt install ffmpeg
 # Example (macOS with Homebrew): brew install ffmpeg

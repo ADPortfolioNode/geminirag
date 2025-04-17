@@ -1,195 +1,122 @@
 import os
 import logging
-import shutil  # Import shutil for file operations
-import speech_recognition as sr
-from moviepy import VideoFileClip  # Corrected import
-# Assuming unstructured and langchain are installed and needed here
-try:
-    from unstructured.partition.pdf import partition_pdf
-except ImportError:
-    partition_pdf = None
-    logging.warning("unstructured[pdf] not installed. PDF processing will be unavailable.")
+import shutil
+from langchain_community.document_loaders import (
+    TextLoader, UnstructuredPDFLoader, UnstructuredFileLoader
+)
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-try:
-    from langchain_community.document_loaders import DirectoryLoader
-    from langchain.text_splitter import CharacterTextSplitter
-except ImportError:
-    DirectoryLoader = None
-    CharacterTextSplitter = None
-    logging.warning("langchain_community or langchain not fully installed. Text file processing might be limited.")
+# Define supported extensions (adjust as needed)
+SUPPORTED_TEXT_EXTENSIONS = {".txt", ".md", ".py", ".json", ".csv", ".html", ".js", ".css"}
+SUPPORTED_PDF_EXTENSIONS = {".pdf"}
 
+# --- Helper Functions for Loading and Splitting ---
 
-def _extract_text_from_audio(audio_path):
-    """Helper function to extract text from an audio file."""
-    recognizer = sr.Recognizer()
+def _load_and_split_documents(filepath: str, filename: str, file_context: str = None) -> list:
+    """Loads and splits a document based on its extension."""
+    _, ext = os.path.splitext(filename)
+    ext = ext.lower()
+    docs = []
+    loader = None
+
+    # Base metadata including the original filename and optional context
+    base_metadata = {"source": filename}
+    if file_context:
+        base_metadata["user_context"] = file_context  # Add user-provided context
+
     try:
-        with sr.AudioFile(audio_path) as source:
-            audio_data = recognizer.record(source)
-            return recognizer.recognize_google(audio_data)
-    except sr.UnknownValueError:
-        logging.warning(f"Google Speech Recognition could not understand audio: {audio_path}")
-        return ""
-    except sr.RequestError as e:
-        logging.error(f"Could not request results from Google Speech Recognition service; {e}: {audio_path}")
-        return ""
-    except Exception as e:
-        logging.error(f"Error processing audio file {audio_path}: {e}")
-        return ""
-
-
-def _extract_text_from_video(video_path):
-    """Helper function to extract text from a video file."""
-    try:
-        video = VideoFileClip(video_path)
-        # Create a temporary audio file path
-        base, _ = os.path.splitext(video_path)
-        audio_path = base + ".wav"
-        video.audio.write_audiofile(audio_path, codec='pcm_s16le')  # Specify codec for compatibility
-        text = _extract_text_from_audio(audio_path)
-        # Clean up temporary audio file
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-        return text
-    except Exception as e:
-        logging.error(f"Error processing video file {video_path}: {e}")
-        return ""
-    finally:
-        # Ensure cleanup even if extraction fails mid-way
-        if 'audio_path' in locals() and os.path.exists(audio_path):
+        if ext in SUPPORTED_TEXT_EXTENSIONS:
+            loader = TextLoader(filepath, encoding="utf-8")  # Specify encoding
+        elif ext in SUPPORTED_PDF_EXTENSIONS:
+            loader = UnstructuredPDFLoader(filepath, mode="single")
+        else:
             try:
-                os.remove(audio_path)
-            except Exception as cleanup_error:
-                logging.error(f"Error cleaning up temporary audio file {audio_path}: {cleanup_error}")
+                loader = UnstructuredFileLoader(filepath, mode="single")
+                logging.info(f"Using UnstructuredFileLoader for unknown extension: {ext}")
+            except Exception as unstruct_err:
+                logging.warning(f"UnstructuredFileLoader failed for {filename}: {unstruct_err}. Skipping file.")
+                return []  # Return empty list if loader fails
 
-
-def _extract_text_from_pdf(pdf_path):
-    """Helper function to extract text from a PDF file."""
-    if partition_pdf is None:
-        logging.error("PDF processing dependency 'unstructured' is not installed.")
-        raise ImportError("Missing dependencies for PDF processing. Install with: pip install 'unstructured[pdf]'")
-    try:
-        elements = partition_pdf(pdf_path)
-        return "\n".join([str(element) for element in elements])
-    except Exception as e:
-        logging.error(f"Error processing PDF file {pdf_path}: {e}")
-        return ""
-
-
-def _load_and_split_text_files(directory_path):
-    """Loads and splits documents from a directory."""
-    if DirectoryLoader is None or CharacterTextSplitter is None:
-        logging.error("Text processing dependencies 'langchain_community' or 'langchain' are not fully installed.")
-        raise ImportError("Missing dependencies for text file processing.")
-    try:
-        loader = DirectoryLoader(directory_path, glob="**/[!.]*", show_progress=True, use_multithreading=True)
-        documents = loader.load()
-        if not documents:
-            logging.warning(f"No documents loaded from {directory_path}")
+        if loader:
+            logging.info(f"Loading document: {filename} using {type(loader).__name__}")
+            docs = loader.load()
+            logging.info(f"Loaded {len(docs)} initial document sections.")
+        else:
+            logging.warning(f"No suitable loader found for file extension: {ext}. Skipping file.")
             return []
-        splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        split_docs = splitter.split_documents(documents)
+
+        # Split the loaded documents
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        split_docs = text_splitter.split_documents(docs)
+
+        # Add base metadata to each split chunk
+        for doc in split_docs:
+            doc.metadata = {**base_metadata, **doc.metadata}  # Merge base metadata with any loader metadata
+
+        logging.info(f"Split document into {len(split_docs)} chunks.")
         return split_docs
+
     except Exception as e:
-        logging.error(f"Error loading/splitting text files from {directory_path}: {e}")
-        return []
+        logging.error(f"Error loading/splitting file {filename}: {e}", exc_info=True)
+        return []  # Return empty list on error
 
+# --- Main Processing Function ---
 
-def process_uploaded_file(filepath, filename, chromadb_instance, persistent_dir):
+def process_uploaded_file(
+    temp_filepath: str,
+    filename: str,
+    chromadb_instance,  # Expecting ChromaDBWrapper instance
+    persistent_dir: str,
+    file_context: str = None  # Add optional context parameter
+) -> tuple[bool, str]:
     """
-    Processes an uploaded file, adds it to ChromaDB, and moves the original
-    to the persistent directory upon success. Cleans up temp file on failure.
+    Processes an uploaded file: loads, splits, adds to ChromaDB, and moves to persistent storage.
 
     Args:
-        filepath (str): The full path to the temporary uploaded file.
-        filename (str): The original name of the uploaded file.
-        chromadb_instance (ChromaDBWrapper): Instance to interact with ChromaDB.
-        persistent_dir (str): The directory to move the file to upon success.
+        temp_filepath: The temporary path where the file was saved.
+        filename: The original (secured) name of the file.
+        chromadb_instance: An instance of ChromaDBWrapper.
+        persistent_dir: The directory to move the file to upon success.
+        file_context: Optional user-provided context string.
 
     Returns:
-        bool: True if processing and moving was successful, False otherwise.
-        str: A message indicating the outcome.
+        A tuple (success: bool, message: str).
     """
-    processing_successful = False
-    message = f"Processing started for '{filename}'."
-    target_filepath = os.path.join(persistent_dir, filename)  # Define target path
-
     try:
-        ext = filename.split('.')[-1].lower()
-        logging.info(f"Processing file: {filename} with extension: {ext}")
+        # Load and split document, passing context
+        split_documents = _load_and_split_documents(temp_filepath, filename, file_context)
 
-        # --- File Type Processing Logic ---
-        if ext in ('mp4', 'avi', 'mov'):
-            text = _extract_text_from_video(filepath)
-            if text:
-                chromadb_instance.add_texts([text], metadatas=[{"source": filename, "type": "video"}])
-                processing_successful = True
-                message = f"Video file '{filename}' processed."
-            else:
-                message = f"Could not extract text from video file '{filename}'."
+        if not split_documents:
+            # Error occurred during loading/splitting or file type not supported
+            # Clean up temp file
+            if os.path.exists(temp_filepath):
+                os.remove(temp_filepath)
+            return False, f"Failed to load or split file '{filename}'. Check logs for details."
 
-        elif ext in ('mp3', 'wav', 'ogg', 'flac'):
-            text = _extract_text_from_audio(filepath)
-            if text:
-                chromadb_instance.add_texts([text], metadatas=[{"source": filename, "type": "audio"}])
-                processing_successful = True
-                message = f"Audio file '{filename}' processed."
-            else:
-                message = f"Could not extract text from audio file '{filename}'."
+        # Add documents (chunks with metadata) to ChromaDB
+        logging.info(f"Adding {len(split_documents)} chunks for '{filename}' to ChromaDB...")
+        chromadb_instance.add_documents(split_documents)
+        logging.info(f"Successfully added chunks for '{filename}' to ChromaDB.")
 
-        elif ext == 'pdf':
-            text = _extract_text_from_pdf(filepath)
-            if text:
-                chromadb_instance.add_texts([text], metadatas=[{"source": filename, "type": "pdf"}])
-                processing_successful = True
-                message = f"PDF file '{filename}' processed."
-            else:
-                message = f"Could not extract text from PDF file '{filename}'."
+        # Move the original file to persistent storage
+        persistent_filepath = os.path.join(persistent_dir, filename)
+        try:
+            shutil.move(temp_filepath, persistent_filepath)
+            logging.info(f"Moved original file to persistent storage: {persistent_filepath}")
+        except Exception as move_err:
+            logging.error(f"Failed to move file {filename} to persistent storage: {move_err}", exc_info=True)
+            if os.path.exists(temp_filepath):
+                os.remove(temp_filepath)
+            return False, f"File processed and added to DB, but failed to move to persistent storage: {move_err}"
 
-        elif ext in ('txt', 'md', 'py', 'js', 'html', 'css', 'json', 'csv'):
-            containing_dir = os.path.dirname(filepath)
-            split_docs = _load_and_split_text_files(containing_dir)
-            relevant_docs = [doc for doc in split_docs if doc.metadata.get('source') == filepath]
-            if relevant_docs:
-                for doc in relevant_docs:
-                    doc.metadata['type'] = 'text'
-                chromadb_instance.add_documents(relevant_docs)
-                processing_successful = True
-                message = f"Text file '{filename}' processed."
-            else:
-                message = f"Could not process text file '{filename}'."
-        else:
-            message = f"Unsupported file type: '{ext}'."
-            logging.warning(f"Unsupported file type: {ext} for file {filename}")
-            # processing_successful remains False
+        return True, f"File '{filename}' processed and indexed successfully."
 
-        # --- Move or Cleanup ---
-        if processing_successful:
-            try:
-                # Ensure target directory exists (should be done at app start, but double-check)
-                os.makedirs(persistent_dir, exist_ok=True)
-                # Move the file from temporary uploads to persistent storage
-                shutil.move(filepath, target_filepath)
-                logging.info(f"Moved processed file from {filepath} to {target_filepath}")
-                message += " File moved to persistent storage."  # Append to success message
-                return True, message
-            except Exception as move_error:
-                logging.error(f"Failed to move file {filepath} to {persistent_dir}: {move_error}", exc_info=True)
-                return False, f"Processed '{filename}' but failed to move file: {move_error}"
-        else:
-            return False, message
-
-    except ImportError as e:
-        logging.error(f"Import error during processing {filename}: {e}")
-        return False, str(e)  # Return specific dependency error
     except Exception as e:
-        logging.error(f"An error occurred while processing the file {filename}: {e}", exc_info=True)
-        return False, f"An internal error occurred while processing '{filename}'."
-    finally:
-        # --- Cleanup on Failure ---
-        if not processing_successful and os.path.exists(filepath):
+        logging.error(f"An unexpected error occurred processing file {filename}: {e}", exc_info=True)
+        if os.path.exists(temp_filepath):
             try:
-                os.remove(filepath)
-                logging.info(f"Cleaned up temporary file after failed processing: {filepath}")
+                os.remove(temp_filepath)
             except Exception as cleanup_error:
-                logging.error(f"Error cleaning up failed file {filepath}: {cleanup_error}")
+                logging.error(f"Error cleaning up temp file {temp_filepath} after processing error: {cleanup_error}")
+        return False, f"An internal error occurred while processing '{filename}'."
 
