@@ -217,86 +217,26 @@ def handle_query():
 
 @app.route('/api/generate_plan', methods=['POST'])
 def generate_plan():
-    data = request.json
-    if not data or 'query' not in data:
-        logging.warning("[Plan] Received plan request with missing data or query field.")
-        return jsonify({'error': 'Missing query in request body.'}), 400
-
-    query = data.get('query', '').strip()
-    logging.info(f"[Plan] Received request to generate plan for query: '{query}'")
-
-    # --- Load Gemini API Spec ---
-    gemini_api_summary = "General text generation, summarization, and question answering." # Default summary
+    """Endpoint to generate a plan for a given query."""
     try:
-        if os.path.exists(GEMINI_API_SPEC_PATH):
-            with open(GEMINI_API_SPEC_PATH, 'r') as f:
-                api_spec = json.load(f)
-                # *** Generate a summary from the spec (adjust based on actual JSON structure) ***
-                capabilities = []
-                if 'functions' in api_spec: # Example: Assuming a 'functions' key
-                    for func_name, details in api_spec['functions'].items():
-                        desc = details.get('description', 'No description available.')
-                        capabilities.append(f"- {func_name}: {desc}")
-                elif 'models' in api_spec: # Alternative: Summarize models
-                     for model in api_spec['models']:
-                         capabilities.append(f"- Model '{model.get('name', 'N/A')}': {model.get('description', 'N/A')}")
+        data = request.json
+        if not data or 'query' not in data:
+            logging.warning("Received plan generation request with missing data or query field.")
+            return jsonify({'error': 'Missing query in request body.'}), 400
 
-                if capabilities:
-                    gemini_api_summary = "Specific capabilities include:\n" + "\n".join(capabilities)
-                else:
-                    logging.warning(f"[Plan] Could not extract specific capabilities from {GEMINI_API_SPEC_PATH}. Using default summary.")
-            logging.info(f"[Plan] Loaded Gemini API spec summary from {GEMINI_API_SPEC_PATH}")
-        else:
-            logging.warning(f"[Plan] Gemini API spec file not found at {GEMINI_API_SPEC_PATH}. Using default summary.")
-    except (json.JSONDecodeError, OSError, Exception) as e:
-        logging.error(f"[Plan] Failed to load or parse Gemini API spec file {GEMINI_API_SPEC_PATH}: {e}", exc_info=True)
-        # Continue with the default summary if loading fails
+        query = data.get('query', '').strip()
+        logging.info(f"Generating plan for query: '{query}'")
 
-    # --- Prepare Planning Prompt ---
-    try:
-        # Define assistant types available for planning
-        available_assistants = [
-            "Internet Searcher: Searches the web for current information on a specific topic.",
-            "File Manager: Reads files from or lists files in the persistent storage directory.",
-            "ChromaDB Admin: Queries the vector database for relevant documents or counts items.",
-            # *** Integrate the loaded summary here ***
-            f"Gemini API Admin: Handles tasks related to the Google Gemini API. {gemini_api_summary}",
-            "Code Interpreter: Executes a given Python code snippet (Use with extreme caution!)."
-        ]
-        assistants_description = "\n".join([f"- {a}" for a in available_assistants])
+        # *** Add your planning logic here ***
+        # This is a placeholder - replace with your actual planning implementation
+        plan = f"1. Search the internet for information about: {query}\n2. Summarize the search results [Gemini API Admin]" # Example plan
+        logging.info(f"Generated plan: {plan}")
 
-        # Instruction for the LLM to generate a plan
-        planning_instruction = (
-            f"Based on the user's request, break it down into a sequence of logical steps. "
-            f"For each step, identify the most appropriate assistant type from the following list to perform it. "
-            f"Pay close attention to the specific capabilities listed for the Gemini API Admin.\n" # Added emphasis
-            f"Present the plan as a numbered list, clearly stating the step and the suggested assistant type.\n\n"
-            f"Available Assistant Types:\n{assistants_description}\n\n"
-            f"User Request: \"{query}\""
-        )
-
-        # Use the Gemini client to generate the plan (no context needed)
-        # We use the 'query' parameter here mainly for logging consistency in generate_response
-        # The actual instruction is in 'task_instruction'
-        plan_text = gemini.generate_response(
-            query=f"Plan for: {query}", # For logging/tracking
-            documents=[],
-            source_type="none",
-            task_instruction=planning_instruction
-        )
-
-        # Basic check if the response looks like a plan (contains numbers, etc.)
-        if not plan_text or not any(char.isdigit() for char in plan_text):
-             logging.warning(f"[Plan] LLM did not return a valid-looking plan for query: '{query}'. Response: {plan_text}")
-             # Fallback or error
-             plan_text = "Sorry, I couldn't generate a detailed plan for that request."
-
-        logging.info(f"[Plan] Generated plan for query '{query}'.")
-        return jsonify({'plan': plan_text})
+        return jsonify({'plan': plan})
 
     except Exception as e:
-        logging.error(f"[Plan] Error generating plan for query '{query}': {e}", exc_info=True)
-        return jsonify({'error': 'An internal error occurred while generating the plan.'}), 500
+        logging.error(f"Error generating plan for query '{query}': {e}", exc_info=True)
+        return jsonify({'error': f"An internal error occurred while generating the plan: {e}"}), 500
 
 @app.route('/api/search', methods=['POST'])
 def handle_search():

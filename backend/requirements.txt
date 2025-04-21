@@ -1,24 +1,24 @@
 # Core Flask App
-flask
-flask-cors
-python-dotenv
+Flask==3.0.2
+Flask-Cors==4.0.0
+python-dotenv==1.0.1
 
 # Database
-chromadb
+chromadb==0.4.24
 
 # LLM API
-google-generativeai
+google-generativeai==0.4.1
 
 # File Processing
-SpeechRecognition
-moviepy
-unstructured[pdf] # Installs unstructured and extras for PDF
-langchain-community # For DirectoryLoader
-langchain # For CharacterTextSplitter
+unstructured==0.12.4 # Added for handling various file types
+langchain_community==0.0.29 # For DirectoryLoader
+langchain==0.1.14 # For CharacterTextSplitter
 pydub # Often needed for audio processing
+sentence-transformers==2.5.1 # Added for relevance scoring
+beautifulsoup4==4.12.3
 
 # HTTP Requests
-requests # Add requests library for internet search
+requests==2.31.0 # Add requests library for internet search
 
 # NOTE: ffmpeg is required by moviepy but must be installed separately on the system.
 # Example (Ubuntu/Debian): sudo apt update && sudo apt install ffmpeg
